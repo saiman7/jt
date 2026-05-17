@@ -23,6 +23,10 @@ if not mt5.initialize():
     print("Failed to initialize MT5")
     mt5.shutdown()
 
+# symbol_info.filling_mode bitmask (MQL5 SYMBOL_FILLING_*; not exported by MetaTrader5 Python)
+SYMBOL_FILLING_FOK = 1
+SYMBOL_FILLING_IOC = 2
+
 TF_MAP = {
     "M1": mt5.TIMEFRAME_M1,
     "M5": mt5.TIMEFRAME_M5,
@@ -115,7 +119,7 @@ def calculate_advanced_liquidity(df, window=5, source_tag="Local"):
 # -------------------------------------------------------------
 @app.get("/api/historical")
 async def get_historical_backtest_data(
-    symbol: str = Query("BTCUSD"), 
+    symbol: str = Query("BTCUSDz"), 
     timeframe: str = Query("M5"), 
     start_time: str = Query(None),  # Expects: ISO String (YYYY-MM-DDTHH:MM) or Unix Timestamp
     end_time: str = Query(None)
@@ -497,9 +501,9 @@ async def place_market_trade(
     order_volume = normalize_volume(float(volume), symbol_info)
 
     filling_type = mt5.ORDER_FILLING_FOK
-    if symbol_info.filling_mode & mt5.SYMBOL_FILLING_FOK:
+    if symbol_info.filling_mode & SYMBOL_FILLING_FOK:
         filling_type = mt5.ORDER_FILLING_FOK
-    elif symbol_info.filling_mode & mt5.SYMBOL_FILLING_IOC:
+    elif symbol_info.filling_mode & SYMBOL_FILLING_IOC:
         filling_type = mt5.ORDER_FILLING_IOC
     else:
         # Fallback for accounts that require standard execution returns (e.g. many CFD/Crypto brokers)
