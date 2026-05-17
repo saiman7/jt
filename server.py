@@ -1,4 +1,5 @@
 import asyncio
+import math
 from datetime import datetime
 from typing import Optional, Tuple
 import pandas as pd
@@ -175,6 +176,19 @@ async def websocket_rates_endpoint(websocket: WebSocket, symbol: str = "BTCUSD",
     except WebSocketDisconnect:
         pass
 
+def normalize_volume(volume: float, symbol_info) -> float:
+    """Snap volume down to the symbol's lot step (e.g. 0.208 → 0.20 when step is 0.01)."""
+    step = float(symbol_info.volume_step) if symbol_info.volume_step else 0.01
+    min_vol = float(symbol_info.volume_min) if symbol_info.volume_min else step
+    if step <= 0:
+        step = 0.01
+    normalized = math.floor(volume / step) * step
+    normalized = max(min_vol, normalized)
+    step_text = f"{step:.10f}".rstrip("0")
+    decimals = len(step_text.split(".")[1]) if "." in step_text else 2
+    return round(normalized, decimals)
+
+
 def _resolve_sl_tp_prices(
     action_upper: str,
     fill_price: float,
@@ -265,6 +279,8 @@ async def place_market_trade(
                 "error": f"Take profit too close to market (min {min_stop_dist} price units).",
             }
 
+    order_volume = normalize_volume(float(volume), symbol_info)
+
     filling_type = mt5.ORDER_FILLING_FOK
     if symbol_info.filling_mode & mt5.SYMBOL_FILLING_FOK:
         filling_type = mt5.ORDER_FILLING_FOK
@@ -277,7 +293,7 @@ async def place_market_trade(
     trade_request = {
         "action": mt5.TRADE_ACTION_DEAL,
         "symbol": symbol_upper,
-        "volume": float(volume),
+        "volume": order_volume,
         "type": order_type,
         "price": float(price),
         "sl": round(float(sl_price), symbol_info.digits) if sl_price > 0 else 0.0,
@@ -306,7 +322,7 @@ async def place_market_trade(
         "success": True,
         "message": f"Successfully executed live market {action_upper} order.",
         "order_id": result.order,
-        "volume": result.volume,
+        "volume": order_volume,
         "execution_price": result.price,
         "sl": round(float(sl_price), symbol_info.digits) if sl_price > 0 else 0.0,
         "tp": round(float(tp_price), symbol_info.digits) if tp_price > 0 else 0.0,
