@@ -31,6 +31,8 @@ TF_MAP = {
     "D1": mt5.TIMEFRAME_D1,
 }
 
+AGENT_MAGIC = 123456
+
 def calculate_advanced_liquidity(df, window=5, source_tag="Local"):
     liquidity_segments = []
     total_candles = len(df)
@@ -216,6 +218,39 @@ def _resolve_sl_tp_prices(
     return sl_price, tp_price
 
 
+@app.get("/api/positions")
+async def get_open_positions(
+    symbol: str = Query(None),
+    magic: int = Query(AGENT_MAGIC),
+):
+    """Return agent-managed open positions so the frontend never stacks orders."""
+    if symbol:
+        positions = mt5.positions_get(symbol=symbol.upper())
+    else:
+        positions = mt5.positions_get()
+
+    if positions is None:
+        return {"positions": []}
+
+    filtered = [p for p in positions if int(p.magic) == int(magic)]
+    return {
+        "positions": [
+            {
+                "ticket": int(p.ticket),
+                "symbol": p.symbol,
+                "type": "BUY" if p.type == mt5.POSITION_TYPE_BUY else "SELL",
+                "volume": float(p.volume),
+                "price_open": float(p.price_open),
+                "sl": float(p.sl),
+                "tp": float(p.tp),
+                "profit": float(p.profit),
+                "time": int(p.time),
+            }
+            for p in filtered
+        ]
+    }
+
+
 @app.post("/api/trade")
 async def place_market_trade(
     symbol: str = Body(..., embed=True),
@@ -229,6 +264,16 @@ async def place_market_trade(
     symbol_upper = symbol.upper()
     action_upper = action.upper()
     
+    existing_positions = mt5.positions_get(symbol=symbol_upper)
+    if existing_positions:
+        agent_positions = [p for p in existing_positions if int(p.magic) == AGENT_MAGIC]
+        if agent_positions:
+            return {
+                "success": False,
+                "error": f"An open {symbol_upper} position already exists. Close it before opening another.",
+                "open_tickets": [int(p.ticket) for p in agent_positions],
+            }
+
     symbol_info = mt5.symbol_info(symbol_upper)
     if symbol_info is None:
         return {"success": False, "error": f"Symbol {symbol_upper} not found in MT5."}
@@ -299,7 +344,7 @@ async def place_market_trade(
         "sl": round(float(sl_price), symbol_info.digits) if sl_price > 0 else 0.0,
         "tp": round(float(tp_price), symbol_info.digits) if tp_price > 0 else 0.0,
         "deviation": 20,
-        "magic": 123456,
+        "magic": AGENT_MAGIC,
         "comment": "Sent via FastAPI Gateway",
         "type_time": mt5.ORDER_TIME_GTC,
         "type_filling": filling_type,
