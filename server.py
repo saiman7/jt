@@ -207,10 +207,13 @@ async def place_market_trade(
         return {"success": False, "error": "Invalid action parameter. Must be 'BUY' or 'SELL'."}
 
     filling_type = mt5.ORDER_FILLING_FOK
-    if symbol_info.filling_mode == mt5.SYMBOL_FILLING_IOC:
+    if symbol_info.filling_mode & mt5.SYMBOL_FILLING_FOK:
+        filling_type = mt5.ORDER_FILLING_FOK
+    elif symbol_info.filling_mode & mt5.SYMBOL_FILLING_IOC:
         filling_type = mt5.ORDER_FILLING_IOC
-    elif symbol_info.filling_mode == mt5.SYMBOL_FILLING_BOC:
-        filling_type = mt5.ORDER_FILLING_BOC
+    else:
+        # Fallback for accounts that require standard execution returns (e.g. many CFD/Crypto brokers)
+        filling_type = mt5.ORDER_FILLING_RETURN
 
     trade_request = {
         "action": mt5.TRADE_ACTION_DEAL,
