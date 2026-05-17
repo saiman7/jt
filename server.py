@@ -1,9 +1,10 @@
 import asyncio
 import math
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 import pandas as pd
 import MetaTrader5 as mt5
+from pydantic import BaseModel, Field
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -32,6 +33,26 @@ TF_MAP = {
 }
 
 AGENT_MAGIC = 123456
+
+
+def resolve_mt5_symbol(raw: str) -> Optional[str]:
+    """
+    Return the symbol string exactly as the broker exposes it in MT5.
+    UI often passes mixed case (e.g. BTCUSDr) while .upper() breaks symbol_info on some servers.
+    """
+    if not raw or not str(raw).strip():
+        return None
+    s = str(raw).strip()
+    for candidate in (s, s.upper(), s.lower()):
+        info = mt5.symbol_info(candidate)
+        if info is not None:
+            return info.name
+    needle = s.upper()
+    for sym in mt5.symbols_get() or ():
+        if sym.name.upper() == needle:
+            return sym.name
+    return None
+
 
 def calculate_advanced_liquidity(df, window=5, source_tag="Local"):
     liquidity_segments = []
@@ -99,7 +120,10 @@ async def get_historical_backtest_data(
     start_time: str = Query(None),  # Expects: ISO String (YYYY-MM-DDTHH:MM) or Unix Timestamp
     end_time: str = Query(None)
 ):
-    symbol = symbol.upper()
+    resolved = resolve_mt5_symbol(symbol)
+    if resolved is None:
+        return {"error": f"No MT5 symbol matching {symbol!r}. Add it in Market Watch (Show All) and use the exact name."}
+    symbol = resolved
     mt5_tf_ltf = TF_MAP.get(timeframe.upper(), mt5.TIMEFRAME_M5)
     mt5_tf_htf = mt5.TIMEFRAME_H4 # 💡 Fixed Higher Timeframe for structural context mapping
     
@@ -157,7 +181,11 @@ async def get_historical_backtest_data(
 @app.websocket("/ws/rates")
 async def websocket_rates_endpoint(websocket: WebSocket, symbol: str = "BTCUSD", timeframe: str = "M1"):
     await websocket.accept()
-    symbol = symbol.upper()
+    resolved = resolve_mt5_symbol(symbol)
+    if resolved is None:
+        await websocket.close(code=4404, reason=f"Unknown symbol: {symbol}")
+        return
+    symbol = resolved
     mt5_tf = TF_MAP.get(timeframe.upper(), mt5.TIMEFRAME_M1)
     
     try:
@@ -189,6 +217,135 @@ def normalize_volume(volume: float, symbol_info) -> float:
     step_text = f"{step:.10f}".rstrip("0")
     decimals = len(step_text.split(".")[1]) if "." in step_text else 2
     return round(normalized, decimals)
+
+
+class LotForRiskIn(BaseModel):
+    """Broker-accurate sizing: matches account currency P&L at SL for the given volume."""
+
+    symbol: str
+    action: str
+    entry_price: float = Field(..., gt=0)
+    sl_price: float = Field(..., gt=0)
+    risk_usd: float = Field(..., gt=0)
+
+
+@app.post("/api/lot-for-risk")
+async def lot_for_risk(req: LotForRiskIn):
+    """Return lot size so that if SL is hit, loss in account currency ≈ risk_usd (before slippage)."""
+    resolved = resolve_mt5_symbol(req.symbol)
+    if resolved is None:
+        return {"success": False, "error": f"Symbol {req.symbol!r} not found in MT5."}
+
+    action_upper = req.action.upper()
+    if action_upper not in ("BUY", "SELL"):
+        return {"success": False, "error": "action must be BUY or SELL"}
+
+    symbol_info = mt5.symbol_info(resolved)
+    if symbol_info is None:
+        return {"success": False, "error": "symbol_info unavailable"}
+
+    order_type = mt5.ORDER_TYPE_BUY if action_upper == "BUY" else mt5.ORDER_TYPE_SELL
+    entry = float(req.entry_price)
+    sl = float(req.sl_price)
+
+    loss_one_lot = mt5.order_calc_profit(order_type, resolved, 1.0, entry, sl)
+    if loss_one_lot is None:
+        return {"success": False, "error": "order_calc_profit failed (invalid prices or symbol)."}
+
+    loss_mag = abs(float(loss_one_lot))
+    if loss_mag < 1e-12:
+        return {"success": False, "error": "Zero loss at SL for 1.0 lot — widen stop or check SL side."}
+
+    raw_vol = float(req.risk_usd) / loss_mag
+    volume = normalize_volume(raw_vol, symbol_info)
+
+    max_vol = float(symbol_info.volume_max) if symbol_info.volume_max else 1000.0
+    if volume > max_vol + 1e-9:
+        return {
+            "success": False,
+            "error": f"Required volume {volume} exceeds symbol maximum {max_vol}.",
+        }
+
+    actual = mt5.order_calc_profit(order_type, resolved, volume, entry, sl)
+    if actual is None:
+        return {"success": False, "error": "order_calc_profit failed for normalized volume."}
+
+    estimated_risk = abs(float(actual))
+    return {
+        "success": True,
+        "volume": volume,
+        "loss_per_lot": loss_mag,
+        "estimated_risk_usd": round(estimated_risk, 2),
+    }
+
+
+class CalcProfitIn(BaseModel):
+    symbol: str
+    action: str
+    volume: float = Field(..., gt=0)
+    price_open: float = Field(..., gt=0)
+    price_close: float = Field(..., gt=0)
+
+
+@app.post("/api/calc-profit")
+async def calc_profit_endpoint(req: CalcProfitIn):
+    """P&L in account currency for closing volume at price_close (excludes balance ops; may miss some fees vs deals)."""
+    resolved = resolve_mt5_symbol(req.symbol)
+    if resolved is None:
+        return {"success": False, "error": f"Symbol {req.symbol!r} not found in MT5."}
+
+    action_upper = req.action.upper()
+    if action_upper not in ("BUY", "SELL"):
+        return {"success": False, "error": "action must be BUY or SELL"}
+
+    if not mt5.symbol_select(resolved, True):
+        pass  # order_calc_profit may still work
+
+    order_type = mt5.ORDER_TYPE_BUY if action_upper == "BUY" else mt5.ORDER_TYPE_SELL
+    profit = mt5.order_calc_profit(
+        order_type,
+        resolved,
+        float(req.volume),
+        float(req.price_open),
+        float(req.price_close),
+    )
+    if profit is None:
+        return {"success": False, "error": "order_calc_profit failed", "mt5_error": mt5.last_error()}
+    return {"success": True, "profit": round(float(profit), 2)}
+
+
+@app.get("/api/closed-position-pnl")
+async def closed_position_pnl(ticket: int = Query(..., gt=0)):
+    """Sum profit+commission+swap for all deals on this position ticket; weighted avg exit from OUT deals."""
+    utc_now = datetime.now(timezone.utc)
+    from_dt = utc_now - timedelta(days=90)
+    deals = mt5.history_deals_get(from_dt, utc_now, group="*", position=ticket)
+    if deals is None:
+        return {"success": False, "error": "history_deals_get failed", "mt5_error": mt5.last_error()}
+    if len(deals) == 0:
+        return {"success": False, "error": "no deals for position"}
+
+    total = 0.0
+    out_deals = []
+    for d in deals:
+        total += float(d.profit) + float(d.commission) + float(d.swap)
+        if d.entry == mt5.DEAL_ENTRY_OUT:
+            out_deals.append(d)
+
+    exit_price = None
+    if out_deals:
+        vol_sum = sum(float(x.volume) for x in out_deals)
+        if vol_sum > 1e-12:
+            exit_price = sum(float(x.price) * float(x.volume) for x in out_deals) / vol_sum
+        else:
+            exit_price = float(max(out_deals, key=lambda x: x.time).price)
+
+    return {
+        "success": True,
+        "total_pnl": round(total, 2),
+        "exit_price": round(exit_price, 5) if exit_price is not None else None,
+        "deal_count": len(deals),
+    }
 
 
 def _resolve_sl_tp_prices(
@@ -225,7 +382,10 @@ async def get_open_positions(
 ):
     """Return agent-managed open positions so the frontend never stacks orders."""
     if symbol:
-        positions = mt5.positions_get(symbol=symbol.upper())
+        resolved = resolve_mt5_symbol(symbol)
+        if resolved is None:
+            return []
+        positions = mt5.positions_get(symbol=resolved)
     else:
         positions = mt5.positions_get()
 
@@ -261,7 +421,17 @@ async def place_market_trade(
     sl_points: int = Body(None, embed=True),
     tp_points: int = Body(None, embed=True),
 ):
-    symbol_upper = symbol.upper()
+    resolved = resolve_mt5_symbol(symbol)
+    if resolved is None:
+        return {
+            "success": False,
+            "error": (
+                f"Symbol {symbol!r} not found in MT5. In the terminal: View → Market Watch → "
+                "right‑click → Symbols, search BTC, and set your app to that exact name."
+            ),
+        }
+
+    symbol_upper = resolved
     action_upper = action.upper()
     
     existing_positions = mt5.positions_get(symbol=symbol_upper)
