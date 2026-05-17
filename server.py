@@ -182,6 +182,29 @@ async def get_historical_backtest_data(
         "liquidity": combined_liquidity
     }
 
+
+@app.get("/api/recent-candles")
+async def recent_candles(
+    symbol: str = Query(...),
+    timeframe: str = Query("M1"),
+    count: int = Query(16, ge=2, le=500),
+):
+    """Last N closed+forming bars for sweep confirmation (e.g. M1 after liquidity injection)."""
+    resolved = resolve_mt5_symbol(symbol)
+    if resolved is None:
+        return {"error": f"No MT5 symbol matching {symbol!r}.", "candles": []}
+    tf = TF_MAP.get(timeframe.upper(), mt5.TIMEFRAME_M1)
+    rates = mt5.copy_rates_from_pos(resolved, tf, 0, count)
+    if rates is None or len(rates) == 0:
+        return {"error": "No rates", "candles": []}
+    df = pd.DataFrame(rates)
+    return {
+        "symbol": resolved,
+        "timeframe": timeframe.upper(),
+        "candles": df[["time", "open", "high", "low", "close"]].to_dict(orient="records"),
+    }
+
+
 @app.websocket("/ws/rates")
 async def websocket_rates_endpoint(websocket: WebSocket, symbol: str = "BTCUSD", timeframe: str = "M1"):
     await websocket.accept()
