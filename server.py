@@ -1,5 +1,6 @@
 import asyncio
 from datetime import datetime
+from typing import Optional, Tuple
 import pandas as pd
 import MetaTrader5 as mt5
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Body
@@ -174,13 +175,42 @@ async def websocket_rates_endpoint(websocket: WebSocket, symbol: str = "BTCUSD",
     except WebSocketDisconnect:
         pass
 
+def _resolve_sl_tp_prices(
+    action_upper: str,
+    fill_price: float,
+    symbol_point: float,
+    sl: Optional[float],
+    tp: Optional[float],
+    sl_points: Optional[int],
+    tp_points: Optional[int],
+) -> Tuple[float, float]:
+    """Prefer absolute sl/tp from the client; fall back to point offsets from fill price."""
+    if action_upper == "BUY":
+        sl_price = float(sl) if sl and sl > 0 else (
+            fill_price - (sl_points * symbol_point) if sl_points else 0.0
+        )
+        tp_price = float(tp) if tp and tp > 0 else (
+            fill_price + (tp_points * symbol_point) if tp_points else 0.0
+        )
+    else:
+        sl_price = float(sl) if sl and sl > 0 else (
+            fill_price + (sl_points * symbol_point) if sl_points else 0.0
+        )
+        tp_price = float(tp) if tp and tp > 0 else (
+            fill_price - (tp_points * symbol_point) if tp_points else 0.0
+        )
+    return sl_price, tp_price
+
+
 @app.post("/api/trade")
 async def place_market_trade(
     symbol: str = Body(..., embed=True),
     action: str = Body(..., embed=True),
     volume: float = Body(0.1, embed=True),
+    sl: float = Body(0.0, embed=True),
+    tp: float = Body(0.0, embed=True),
     sl_points: int = Body(None, embed=True),
-    tp_points: int = Body(None, embed=True)
+    tp_points: int = Body(None, embed=True),
 ):
     symbol_upper = symbol.upper()
     action_upper = action.upper()
@@ -193,18 +223,47 @@ async def place_market_trade(
         if not mt5.symbol_select(symbol_upper, True):
             return {"success": False, "error": f"Failed to select/show symbol {symbol_upper}."}
 
+    tick = mt5.symbol_info_tick(symbol_upper)
+    if tick is None:
+        return {"success": False, "error": f"No live tick available for {symbol_upper}."}
+
     if action_upper == "BUY":
         order_type = mt5.ORDER_TYPE_BUY
-        price = mt5.symbol_info_tick(symbol_upper).ask
-        sl_price = price - (sl_points * symbol_info.point) if sl_points else 0.0
-        tp_price = price + (tp_points * symbol_info.point) if tp_points else 0.0
+        price = tick.ask
     elif action_upper == "SELL":
         order_type = mt5.ORDER_TYPE_SELL
-        price = mt5.symbol_info_tick(symbol_upper).bid
-        sl_price = price + (sl_points * symbol_info.point) if sl_points else 0.0
-        tp_price = price - (tp_points * symbol_info.point) if tp_points else 0.0
+        price = tick.bid
     else:
         return {"success": False, "error": "Invalid action parameter. Must be 'BUY' or 'SELL'."}
+
+    sl_price, tp_price = _resolve_sl_tp_prices(
+        action_upper, price, symbol_info.point, sl, tp, sl_points, tp_points
+    )
+
+    if sl_price > 0:
+        if action_upper == "BUY" and sl_price >= price:
+            return {"success": False, "error": "BUY stop loss must be below entry price."}
+        if action_upper == "SELL" and sl_price <= price:
+            return {"success": False, "error": "SELL stop loss must be above entry price."}
+    if tp_price > 0:
+        if action_upper == "BUY" and tp_price <= price:
+            return {"success": False, "error": "BUY take profit must be above entry price."}
+        if action_upper == "SELL" and tp_price >= price:
+            return {"success": False, "error": "SELL take profit must be below entry price."}
+
+    # Enforce broker minimum stop distance when stops are provided
+    min_stop_dist = symbol_info.trade_stops_level * symbol_info.point
+    if min_stop_dist > 0:
+        if sl_price > 0 and abs(price - sl_price) < min_stop_dist:
+            return {
+                "success": False,
+                "error": f"Stop loss too close to market (min {min_stop_dist} price units).",
+            }
+        if tp_price > 0 and abs(price - tp_price) < min_stop_dist:
+            return {
+                "success": False,
+                "error": f"Take profit too close to market (min {min_stop_dist} price units).",
+            }
 
     filling_type = mt5.ORDER_FILLING_FOK
     if symbol_info.filling_mode & mt5.SYMBOL_FILLING_FOK:
@@ -248,5 +307,7 @@ async def place_market_trade(
         "message": f"Successfully executed live market {action_upper} order.",
         "order_id": result.order,
         "volume": result.volume,
-        "execution_price": result.price
+        "execution_price": result.price,
+        "sl": round(float(sl_price), symbol_info.digits) if sl_price > 0 else 0.0,
+        "tp": round(float(tp_price), symbol_info.digits) if tp_price > 0 else 0.0,
     }
