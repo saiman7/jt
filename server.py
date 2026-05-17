@@ -1,5 +1,7 @@
 import asyncio
 import math
+import os
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 import pandas as pd
@@ -8,7 +10,33 @@ from pydantic import BaseModel, Field
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI()
+from mt5_common import (
+    SYMBOL_FILLING_FOK,
+    SYMBOL_FILLING_IOC,
+    ensure_mt5,
+    resolve_mt5_symbol,
+)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Optional: run trader in-process (same MT5 session as the API)."""
+    trader_task = None
+    if os.environ.get("ENABLE_TRADER", "").strip().lower() in ("1", "true", "yes"):
+        from trader import TradingEngine
+
+        engine = TradingEngine(reuse_mt5=True)
+        trader_task = asyncio.create_task(engine.run())
+    yield
+    if trader_task is not None:
+        trader_task.cancel()
+        try:
+            await trader_task
+        except asyncio.CancelledError:
+            pass
+
+
+app = FastAPI(lifespan=lifespan)
 
 # Enable CORS to allow your frontend application to securely access this backend api
 app.add_middleware(
@@ -19,13 +47,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-if not mt5.initialize():
+_mt5_ok, _ = ensure_mt5()
+if not _mt5_ok:
     print("Failed to initialize MT5")
-    mt5.shutdown()
-
-# symbol_info.filling_mode bitmask (MQL5 SYMBOL_FILLING_*; not exported by MetaTrader5 Python)
-SYMBOL_FILLING_FOK = 1
-SYMBOL_FILLING_IOC = 2
 
 TF_MAP = {
     "M1": mt5.TIMEFRAME_M1,
@@ -37,25 +61,6 @@ TF_MAP = {
 }
 
 AGENT_MAGIC = 123456
-
-
-def resolve_mt5_symbol(raw: str) -> Optional[str]:
-    """
-    Return the symbol string exactly as the broker exposes it in MT5.
-    UI often passes mixed case (e.g. BTCUSDr) while .upper() breaks symbol_info on some servers.
-    """
-    if not raw or not str(raw).strip():
-        return None
-    s = str(raw).strip()
-    for candidate in (s, s.upper(), s.lower()):
-        info = mt5.symbol_info(candidate)
-        if info is not None:
-            return info.name
-    needle = s.upper()
-    for sym in mt5.symbols_get() or ():
-        if sym.name.upper() == needle:
-            return sym.name
-    return None
 
 
 def calculate_advanced_liquidity(df, window=5, source_tag="Local"):
@@ -119,7 +124,7 @@ def calculate_advanced_liquidity(df, window=5, source_tag="Local"):
 # -------------------------------------------------------------
 @app.get("/api/historical")
 async def get_historical_backtest_data(
-    symbol: str = Query("BTCUSDz"), 
+    symbol: str = Query("XAUUSD"), 
     timeframe: str = Query("M5"), 
     start_time: str = Query(None),  # Expects: ISO String (YYYY-MM-DDTHH:MM) or Unix Timestamp
     end_time: str = Query(None)
@@ -206,7 +211,7 @@ async def recent_candles(
 
 
 @app.websocket("/ws/rates")
-async def websocket_rates_endpoint(websocket: WebSocket, symbol: str = "BTCUSD", timeframe: str = "M1"):
+async def websocket_rates_endpoint(websocket: WebSocket, symbol: str = "XAUUSD", timeframe: str = "M1"):
     await websocket.accept()
     resolved = resolve_mt5_symbol(symbol)
     if resolved is None:
@@ -454,7 +459,7 @@ async def place_market_trade(
             "success": False,
             "error": (
                 f"Symbol {symbol!r} not found in MT5. In the terminal: View → Market Watch → "
-                "right‑click → Symbols, search BTC, and set your app to that exact name."
+                "right‑click → Symbols, search XAU/GOLD, and set your app to that exact name."
             ),
         }
 
