@@ -127,36 +127,21 @@ def emit_reversal_signal(p: PendingSetup, confirm_bar: Candle, *, is_prediction:
     }
 
 
-def can_enter_after_sweep(
-    sweep_time: int,
-    evaluation_time: int,
-    predicted: bool,
-    period_sec: int = M5_PERIOD_SEC,
-) -> bool:
-    if evaluation_time < sweep_time:
-        return False
-    bars_since = count_confirm_bars_since(sweep_time, evaluation_time, period_sec)
-    if bars_since > REVERSAL_CONFIRM_MAX_BARS:
-        return False
-    if predicted:
-        return True
-    return bars_since > 0
-
-
 def scan_reversal_predictions(
     pending: list[PendingSetup],
     forming_confirm: Optional[Candle],
     consumed_keys: Optional[set[str]] = None,
-    evaluation_time: Optional[int] = None,
 ) -> list[ReversalSignal]:
     if not forming_confirm:
         return []
     consumed = consumed_keys or set()
-    eval_time = evaluation_time if evaluation_time is not None else forming_confirm["time"]
     out: list[ReversalSignal] = []
 
     for p in pending:
-        if not can_enter_after_sweep(p["sweepTime"], eval_time, True):
+        if forming_confirm["time"] <= p["sweepTime"]:
+            continue
+        bars_since = count_confirm_bars_since(p["sweepTime"], forming_confirm["time"])
+        if bars_since == 0 or bars_since > REVERSAL_CONFIRM_MAX_BARS:
             continue
         key = _level_key(p["levelType"], p["liquidityTargetPrice"])
         if key in consumed:
@@ -327,8 +312,7 @@ def analyze_live_reversals(
     elif chart_candles:
         forming = chart_candles[-1]
 
-    eval_time = chart_candles[-1]["time"] if chart_candles else 0
-    predictions = scan_reversal_predictions(pending, forming, evaluation_time=eval_time)
+    predictions = scan_reversal_predictions(pending, forming)
     confirmed_keys = {
         _level_key(s["levelType"], s["liquidityPrice"])
         for s in signals

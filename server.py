@@ -15,7 +15,6 @@ from reversal_engine import (
     get_reversal_confirm_timeframe,
     uses_separate_confirm_timeframe,
 )
-from htf_alignment import HTF_CASCADE, evaluate_htf_cascade
 
 app = FastAPI()
 
@@ -453,25 +452,6 @@ async def reversal_scan(body: ReversalScanBody):
     return result
 
 
-@app.get("/api/htf-candles")
-async def htf_candles(
-    symbol: str = Query(...),
-    count: int = Query(120, ge=20, le=500),
-):
-    """M15 / H1 / H4 / D1 bars for HTF alignment cascade."""
-    resolved = resolve_mt5_symbol(symbol)
-    if resolved is None:
-        return {"error": f"No MT5 symbol matching {symbol!r}."}
-    out: dict[str, list] = {}
-    for tf in HTF_CASCADE:
-        candles, err = copy_rates_as_candles(resolved, tf, count)
-        if err:
-            out[tf] = []
-        else:
-            out[tf] = candles
-    return {"symbol": resolved, "htfCandles": out}
-
-
 @app.websocket("/ws/rates")
 async def websocket_rates_endpoint(websocket: WebSocket, symbol: str = "BTCUSD", timeframe: str = "M1"):
     await websocket.accept()
@@ -501,9 +481,7 @@ async def websocket_rates_endpoint(websocket: WebSocket, symbol: str = "BTCUSD",
 
                 chart_tf = timeframe.upper()
                 if uses_separate_confirm_timeframe(chart_tf):
-                    confirm_candles, _ = copy_rates_as_candles(
-                        symbol, get_reversal_confirm_timeframe(chart_tf), 80
-                    )
+                    confirm_candles, _ = copy_rates_as_candles(symbol, get_reversal_confirm_timeframe(chart_tf), 80)
                     reversal = analyze_live_reversals(
                         chart_candles,
                         confirm_candles,
@@ -515,23 +493,9 @@ async def websocket_rates_endpoint(websocket: WebSocket, symbol: str = "BTCUSD",
                     payload["reversalSignals"] = reversal.get("signals", [])
                     payload["reversalPredictions"] = reversal.get("predictions", [])
                     payload["confirmTimeframe"] = reversal.get("confirmTimeframe")
-                    if len(confirm_candles) >= 2:
-                        payload["closedConfirmCandle"] = confirm_candles[-2]
-
-                    htf_by_tf: dict[str, list] = {}
-                    for htf in HTF_CASCADE:
-                        htf_rows, _ = copy_rates_as_candles(symbol, htf, 120)
-                        htf_by_tf[htf] = htf_rows
-                    payload["htfCandles"] = htf_by_tf
-
-                    eval_time = chart_candles[-1]["time"] if chart_candles else 0
-                    for side in ("BUY", "SELL"):
-                        payload[f"htfAlignment_{side}"] = evaluate_htf_cascade(
-                            side, eval_time, chart_candles, htf_by_tf
-                        )
 
                 await websocket.send_json(payload)
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(1)
     except WebSocketDisconnect:
         pass
 
