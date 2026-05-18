@@ -1,12 +1,20 @@
 import asyncio
 import math
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Tuple
+from typing import Any, List, Optional, Tuple
 import pandas as pd
 import MetaTrader5 as mt5
 from pydantic import BaseModel, Field
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
+
+from reversal_engine import (
+    analyze_live_reversals,
+    build_forming_m5_from_m1,
+    df_to_candles,
+    get_reversal_confirm_timeframe,
+    uses_separate_confirm_timeframe,
+)
 
 app = FastAPI()
 
@@ -58,10 +66,25 @@ def resolve_mt5_symbol(raw: str) -> Optional[str]:
     return None
 
 
+def copy_rates_as_candles(
+    symbol: str, timeframe: str, count: int
+) -> Tuple[List[dict], Optional[str]]:
+    """Fetch last N bars from MT5 as candle dicts."""
+    resolved = resolve_mt5_symbol(symbol)
+    if resolved is None:
+        return [], f"No MT5 symbol matching {symbol!r}."
+    tf = TF_MAP.get(timeframe.upper(), mt5.TIMEFRAME_M1)
+    rates = mt5.copy_rates_from_pos(resolved, tf, 0, count)
+    if rates is None or len(rates) == 0:
+        return [], "No rates"
+    df = pd.DataFrame(rates)
+    return df_to_candles(df), None
+
+
 def calculate_advanced_liquidity(df, window=5, source_tag="Local"):
     liquidity_segments = []
     total_candles = len(df)
-    seen_prices = set()
+    seen_level_keys = set()
 
     for i in range(window, total_candles - window):
         current_high = float(df.iloc[i]['high'])
@@ -71,8 +94,9 @@ def calculate_advanced_liquidity(df, window=5, source_tag="Local"):
         # 1. Swing High (BSL)
         if current_high > df.iloc[i-window:i]['high'].max() and current_high >= df.iloc[i+1:i+window+1]['high'].max():
             rounded_price = round(current_high, 2)
-            if rounded_price not in seen_prices:
-                seen_prices.add(rounded_price)
+            bsl_key = f"BSL-{rounded_price}"
+            if bsl_key not in seen_level_keys:
+                seen_level_keys.add(bsl_key)
                 end_ts = int(df.iloc[-1]['time'])
                 has_been_swept = False
                 
@@ -93,8 +117,9 @@ def calculate_advanced_liquidity(df, window=5, source_tag="Local"):
         # 2. Swing Low (SSL)
         if current_low < df.iloc[i-window:i]['low'].min() and current_low <= df.iloc[i+1:i+window+1]['low'].min():
             rounded_price = round(current_low, 2)
-            if rounded_price not in seen_prices:
-                seen_prices.add(rounded_price)
+            ssl_key = f"SSL-{rounded_price}"
+            if ssl_key not in seen_level_keys:
+                seen_level_keys.add(ssl_key)
                 end_ts = int(df.iloc[-1]['time'])
                 has_been_swept = False
                 
@@ -113,6 +138,75 @@ def calculate_advanced_liquidity(df, window=5, source_tag="Local"):
                 })
 
     return liquidity_segments
+
+
+def calculate_fib_golden_zones(swings, max_recent=12, source_prefix="Fib_50"):
+    """
+    Pair consecutive opposite swings into legs and emit the 50% retracement as a
+    sweep target. Output reuses BSL/SSL types so the existing engine treats them
+    like structural liquidity (one-candle SL, post-sweep confirm, MT5 sizing).
+
+      Bearish leg  (BSL -> SSL)  → 50% emitted as BSL  (sweep up + reject = SELL)
+      Bullish leg  (SSL -> BSL)  → 50% emitted as SSL  (sweep down + reject = BUY)
+    """
+    if not swings or len(swings) < 2:
+        return []
+
+    sorted_swings = sorted(swings, key=lambda s: s.get("start_time", 0))
+    zones = []
+
+    for i in range(1, len(sorted_swings)):
+        prev = sorted_swings[i - 1]
+        curr = sorted_swings[i]
+        prev_type = prev.get("type")
+        curr_type = curr.get("type")
+        if prev_type == curr_type:
+            continue
+
+        try:
+            prev_price = float(prev.get("price", 0))
+            curr_price = float(curr.get("price", 0))
+        except (TypeError, ValueError):
+            continue
+
+        # Bearish leg: high → low ; mid is a SELL retracement target
+        if prev_type == "BSL" and curr_type == "SSL":
+            high = prev_price
+            low = curr_price
+            if high <= low:
+                continue
+            mid = round((high + low) / 2.0, 5)
+            zones.append({
+                "type": "BSL",
+                "price": mid,
+                "start_time": int(curr.get("start_time", 0)),
+                "end_time": int(curr.get("end_time", 0)),
+                "is_grabbed": False,
+                "level_source": source_prefix,
+                "leg_high": high,
+                "leg_low": low,
+            })
+
+        # Bullish leg: low → high ; mid is a BUY retracement target
+        elif prev_type == "SSL" and curr_type == "BSL":
+            low = prev_price
+            high = curr_price
+            if high <= low:
+                continue
+            mid = round((high + low) / 2.0, 5)
+            zones.append({
+                "type": "SSL",
+                "price": mid,
+                "start_time": int(curr.get("start_time", 0)),
+                "end_time": int(curr.get("end_time", 0)),
+                "is_grabbed": False,
+                "level_source": source_prefix,
+                "leg_high": high,
+                "leg_low": low,
+            })
+
+    return zones[-max_recent:]
+
 
 # -------------------------------------------------------------
 # UPGRADED ROUTE: MULTI-TIMEFRAME LIQUIDITY AGGREGATOR
@@ -174,7 +268,12 @@ async def get_historical_backtest_data(
 
     # Combine both local triggers and macro targets into an integrated landscape array
     combined_liquidity = ltf_liquidity + htf_liquidity
-    
+
+    # Add Fib 50% golden-zone retracement targets for trend continuation entries
+    fib_local = calculate_fib_golden_zones(ltf_liquidity, max_recent=12, source_prefix="Fib_50_Local")
+    fib_macro = calculate_fib_golden_zones(htf_liquidity, max_recent=6, source_prefix="Fib_50_Macro_H4")
+    combined_liquidity = combined_liquidity + fib_local + fib_macro
+
     return {
         "symbol": symbol,
         "timeframe": timeframe,
@@ -189,7 +288,7 @@ async def recent_candles(
     timeframe: str = Query("M1"),
     count: int = Query(16, ge=2, le=500),
 ):
-    """Last N closed+forming bars for sweep confirmation (e.g. M1 after liquidity injection)."""
+    """Last N closed+forming bars for sweep confirmation (e.g. M5 when chart is M1)."""
     resolved = resolve_mt5_symbol(symbol)
     if resolved is None:
         return {"error": f"No MT5 symbol matching {symbol!r}.", "candles": []}
@@ -203,6 +302,154 @@ async def recent_candles(
         "timeframe": timeframe.upper(),
         "candles": df[["time", "open", "high", "low", "close"]].to_dict(orient="records"),
     }
+
+
+@app.get("/api/health")
+async def health_check():
+    """Liveness probe for the MT5 gateway."""
+    terminal = mt5.terminal_info()
+    account = mt5.account_info()
+    return {
+        "ok": terminal is not None,
+        "mt5_connected": terminal is not None,
+        "terminal": terminal.name if terminal else None,
+        "account_login": account.login if account else None,
+    }
+
+
+@app.get("/api/forming-candle")
+async def forming_candle(
+    symbol: str = Query(...),
+    chart_timeframe: str = Query("M1"),
+    m1_count: int = Query(300, ge=10, le=2000),
+):
+    """
+    Live forming confirm candle (e.g. aggregate current M5 bucket from M1 stream).
+    Use before M5 close for reversal prediction.
+    """
+    resolved = resolve_mt5_symbol(symbol)
+    if resolved is None:
+        return {"error": f"No MT5 symbol matching {symbol!r}."}
+
+    chart_tf = chart_timeframe.upper()
+    if uses_separate_confirm_timeframe(chart_tf):
+        m1_candles, err = copy_rates_as_candles(resolved, "M1", m1_count)
+        if err:
+            return {"error": err, "forming": None}
+        forming = build_forming_m5_from_m1(m1_candles)
+        return {
+            "symbol": resolved,
+            "chartTimeframe": chart_tf,
+            "confirmTimeframe": get_reversal_confirm_timeframe(chart_tf),
+            "forming": forming,
+        }
+
+    candles, err = copy_rates_as_candles(resolved, chart_tf, min(m1_count, 500))
+    if err:
+        return {"error": err, "forming": None}
+    forming = candles[-1] if candles else None
+    return {
+        "symbol": resolved,
+        "chartTimeframe": chart_tf,
+        "confirmTimeframe": chart_tf,
+        "forming": forming,
+    }
+
+
+@app.get("/api/reversal-live")
+async def reversal_live(
+    symbol: str = Query(...),
+    chart_timeframe: str = Query("M1"),
+    chart_count: int = Query(300, ge=50, le=2000),
+    confirm_count: int = Query(150, ge=20, le=500),
+    trend_filter: bool = Query(False),
+):
+    """
+    Confirmed reversal signals + forming-bar predictions from live MT5 data.
+    Chart TF M1 → sweeps on M1, confirm/predict on forming M5.
+    """
+    resolved = resolve_mt5_symbol(symbol)
+    if resolved is None:
+        return {"error": f"No MT5 symbol matching {symbol!r}."}
+
+    chart_tf = chart_timeframe.upper()
+    chart_candles, err = copy_rates_as_candles(resolved, chart_tf, chart_count)
+    if err:
+        return {"error": err}
+
+    confirm_tf = get_reversal_confirm_timeframe(chart_tf)
+    if uses_separate_confirm_timeframe(chart_tf):
+        confirm_candles, cerr = copy_rates_as_candles(resolved, confirm_tf, confirm_count)
+        if cerr:
+            return {"error": cerr}
+    else:
+        confirm_candles = chart_candles
+
+    df_chart = pd.DataFrame(chart_candles)
+    liquidity = calculate_advanced_liquidity(df_chart, window=5, source_tag="Local")
+    fib = calculate_fib_golden_zones(liquidity, max_recent=6, source_prefix="Fib_50_Local")
+    combined = liquidity + fib
+
+    result = analyze_live_reversals(
+        chart_candles,
+        confirm_candles,
+        combined,
+        chart_timeframe=chart_tf,
+        trend_filter=trend_filter,
+    )
+    return {
+        "symbol": resolved,
+        "liquidity": combined[-20:],
+        **result,
+    }
+
+
+class ReversalScanBody(BaseModel):
+    chart_candles: List[dict] = Field(..., min_length=1)
+    confirm_candles: Optional[List[dict]] = None
+    liquidity: List[dict] = Field(default_factory=list)
+    chart_timeframe: str = "M1"
+    trend_filter: bool = False
+
+
+@app.post("/api/reversal-scan")
+async def reversal_scan(body: ReversalScanBody):
+    """Scan client-supplied candles (backtest export or custom feed) for reversals + predictions."""
+    chart_tf = body.chart_timeframe.upper()
+    confirm = body.confirm_candles
+    if confirm is None:
+        confirm = body.chart_candles
+
+    chart = [
+        {
+            "time": int(c["time"]),
+            "open": float(c["open"]),
+            "high": float(c["high"]),
+            "low": float(c["low"]),
+            "close": float(c["close"]),
+        }
+        for c in body.chart_candles
+    ]
+    confirm_candles = [
+        {
+            "time": int(c["time"]),
+            "open": float(c["open"]),
+            "high": float(c["high"]),
+            "low": float(c["low"]),
+            "close": float(c["close"]),
+        }
+        for c in confirm
+    ]
+    liquidity = body.liquidity
+
+    result = analyze_live_reversals(
+        chart,
+        confirm_candles,
+        liquidity,
+        chart_timeframe=chart_tf,
+        trend_filter=body.trend_filter,
+    )
+    return result
 
 
 @app.websocket("/ws/rates")
@@ -220,14 +467,33 @@ async def websocket_rates_endpoint(websocket: WebSocket, symbol: str = "BTCUSD",
             rates = mt5.copy_rates_from_pos(symbol, mt5_tf, 0, 250)
             if rates is not None and len(rates) > 0:
                 df = pd.DataFrame(rates)
+                chart_candles = df_to_candles(df)
                 advanced_liquidity = calculate_advanced_liquidity(df, window=5, source_tag="Local")
-                
-                payload = {
+                fib_zones = calculate_fib_golden_zones(advanced_liquidity, max_recent=6, source_prefix="Fib_50_Local")
+                combined_liquidity = advanced_liquidity[-10:] + fib_zones
+
+                payload: dict[str, Any] = {
                     "symbol": symbol,
                     "timeframe": timeframe,
                     "data": df[["time", "open", "high", "low", "close"]].to_dict(orient="records"),
-                    "liquidity": advanced_liquidity[-10:] 
+                    "liquidity": combined_liquidity,
                 }
+
+                chart_tf = timeframe.upper()
+                if uses_separate_confirm_timeframe(chart_tf):
+                    confirm_candles, _ = copy_rates_as_candles(symbol, get_reversal_confirm_timeframe(chart_tf), 80)
+                    reversal = analyze_live_reversals(
+                        chart_candles,
+                        confirm_candles,
+                        combined_liquidity,
+                        chart_timeframe=chart_tf,
+                        trend_filter=False,
+                    )
+                    payload["formingConfirmCandle"] = reversal.get("formingConfirmCandle")
+                    payload["reversalSignals"] = reversal.get("signals", [])
+                    payload["reversalPredictions"] = reversal.get("predictions", [])
+                    payload["confirmTimeframe"] = reversal.get("confirmTimeframe")
+
                 await websocket.send_json(payload)
             await asyncio.sleep(1)
     except WebSocketDisconnect:
