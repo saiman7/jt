@@ -317,6 +317,20 @@ async def health_check():
     }
 
 
+@app.get("/api/account-balance")
+async def account_balance():
+    """Current MT5 account balance (realized PnL applies on position close)."""
+    account = mt5.account_info()
+    if account is None:
+        return {"success": False, "error": "account_info unavailable", "mt5_error": mt5.last_error()}
+    return {
+        "success": True,
+        "balance": round(float(account.balance), 2),
+        "equity": round(float(account.equity), 2),
+        "login": int(account.login),
+    }
+
+
 @app.get("/api/forming-candle")
 async def forming_candle(
     symbol: str = Query(...),
@@ -615,12 +629,6 @@ async def closed_position_pnl(ticket: int = Query(..., gt=0)):
     deals = mt5.history_deals_get(from_dt, utc_now, group="*", position=ticket)
     if deals is None:
         return {"success": False, "error": "history_deals_get failed", "mt5_error": mt5.last_error()}
-    if len(deals) == 0:
-        recent = mt5.history_deals_get(utc_now - timedelta(hours=24), utc_now)
-        if recent is not None:
-            deals = tuple(
-                d for d in recent if int(getattr(d, "position_id", 0) or getattr(d, "position", 0)) == int(ticket)
-            )
     if len(deals) == 0:
         return {"success": False, "error": "no deals for position"}
 
