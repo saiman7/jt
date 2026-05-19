@@ -314,114 +314,6 @@ async def health_check():
         "mt5_connected": terminal is not None,
         "terminal": terminal.name if terminal else None,
         "account_login": account.login if account else None,
-        "balance": round(float(account.balance), 2) if account else None,
-        "equity": round(float(account.equity), 2) if account else None,
-        "profit": round(float(account.profit), 2) if account else None,
-        "trade_allowed": bool(terminal.trade_allowed) if terminal else False,
-        "trade_expert": bool(account.trade_expert) if account else False,
-        "currency": account.currency if account else None,
-    }
-
-
-def _compute_closed_position_pnl(ticket: int, lookback_days: int = 90) -> dict[str, Any]:
-    """Sum profit+commission+swap from MT5 deal history for a closed position."""
-    utc_now = datetime.now(timezone.utc)
-    from_dt = utc_now - timedelta(days=lookback_days)
-    deals = mt5.history_deals_get(from_dt, utc_now, group="*", position=int(ticket))
-    if deals is None:
-        err = mt5.last_error()
-        return {"success": False, "error": "history_deals_get failed", "mt5_error": err}
-
-    if len(deals) == 0:
-        all_deals = mt5.history_deals_get(from_dt, utc_now, group="*")
-        if all_deals:
-            deals = tuple(d for d in all_deals if int(d.position) == int(ticket))
-
-    if not deals:
-        return {"success": False, "error": "no deals for position", "ticket": int(ticket)}
-
-    gross_profit = 0.0
-    commission = 0.0
-    swap = 0.0
-    out_deals = []
-    for d in deals:
-        gross_profit += float(d.profit)
-        commission += float(d.commission)
-        swap += float(d.swap)
-        if d.entry == mt5.DEAL_ENTRY_OUT:
-            out_deals.append(d)
-
-    total_pnl = gross_profit + commission + swap
-
-    exit_price = None
-    if out_deals:
-        vol_sum = sum(float(x.volume) for x in out_deals)
-        if vol_sum > 1e-12:
-            exit_price = sum(float(x.price) * float(x.volume) for x in out_deals) / vol_sum
-        else:
-            exit_price = float(max(out_deals, key=lambda x: x.time).price)
-
-    return {
-        "success": True,
-        "ticket": int(ticket),
-        "total_pnl": round(total_pnl, 2),
-        "gross_profit": round(gross_profit, 2),
-        "commission": round(commission, 2),
-        "swap": round(swap, 2),
-        "exit_price": round(exit_price, 5) if exit_price is not None else None,
-        "deal_count": len(deals),
-    }
-
-
-async def _closed_position_pnl_with_retry(
-    ticket: int, attempts: int = 6
-) -> dict[str, Any]:
-    """Deals can lag a few hundred ms after a market close — retry before failing."""
-    last: dict[str, Any] = {"success": False, "error": "no deals for position"}
-    for attempt in range(attempts):
-        last = _compute_closed_position_pnl(ticket)
-        if last.get("success"):
-            return last
-        if attempt < attempts - 1:
-            await asyncio.sleep(0.2 * (attempt + 1))
-    return last
-
-
-@app.get("/api/account-pnl")
-async def account_pnl(magic: int = Query(AGENT_MAGIC)):
-    """Live account + agent-position floating P&L from the broker (not simulated)."""
-    account = mt5.account_info()
-    if account is None:
-        return {"success": False, "error": "account_info unavailable"}
-
-    positions = mt5.positions_get()
-    if positions is None:
-        positions = ()
-
-    agent_positions = [p for p in positions if int(p.magic) == int(magic)]
-    agent_floating = sum(float(p.profit) for p in agent_positions)
-
-    return {
-        "success": True,
-        "balance": round(float(account.balance), 2),
-        "equity": round(float(account.equity), 2),
-        "account_floating_pnl": round(float(account.profit), 2),
-        "agent_floating_pnl": round(agent_floating, 2),
-        "currency": account.currency,
-        "open_agent_positions": len(agent_positions),
-        "positions": [
-            {
-                "ticket": int(p.ticket),
-                "symbol": p.symbol,
-                "type": "BUY" if p.type == mt5.POSITION_TYPE_BUY else "SELL",
-                "volume": float(p.volume),
-                "price_open": float(p.price_open),
-                "profit": round(float(p.profit), 2),
-                "sl": float(p.sl),
-                "tp": float(p.tp),
-            }
-            for p in agent_positions
-        ],
     }
 
 
@@ -716,12 +608,37 @@ async def calc_profit_endpoint(req: CalcProfitIn):
 
 
 @app.get("/api/closed-position-pnl")
-async def closed_position_pnl(
-    ticket: int = Query(..., gt=0),
-    retries: int = Query(6, ge=1, le=12),
-):
-    """Realized P&L from MT5 deal history (profit + commission + swap). Retries while deals sync."""
-    return await _closed_position_pnl_with_retry(ticket, attempts=retries)
+async def closed_position_pnl(ticket: int = Query(..., gt=0)):
+    """Sum profit+commission+swap for all deals on this position ticket; weighted avg exit from OUT deals."""
+    utc_now = datetime.now(timezone.utc)
+    from_dt = utc_now - timedelta(days=90)
+    deals = mt5.history_deals_get(from_dt, utc_now, group="*", position=ticket)
+    if deals is None:
+        return {"success": False, "error": "history_deals_get failed", "mt5_error": mt5.last_error()}
+    if len(deals) == 0:
+        return {"success": False, "error": "no deals for position"}
+
+    total = 0.0
+    out_deals = []
+    for d in deals:
+        total += float(d.profit) + float(d.commission) + float(d.swap)
+        if d.entry == mt5.DEAL_ENTRY_OUT:
+            out_deals.append(d)
+
+    exit_price = None
+    if out_deals:
+        vol_sum = sum(float(x.volume) for x in out_deals)
+        if vol_sum > 1e-12:
+            exit_price = sum(float(x.price) * float(x.volume) for x in out_deals) / vol_sum
+        else:
+            exit_price = float(max(out_deals, key=lambda x: x.time).price)
+
+    return {
+        "success": True,
+        "total_pnl": round(total, 2),
+        "exit_price": round(exit_price, 5) if exit_price is not None else None,
+        "deal_count": len(deals),
+    }
 
 
 def _resolve_sl_tp_prices(
@@ -779,13 +696,11 @@ async def get_open_positions(
                 "price_open": float(p.price_open),
                 "sl": float(p.sl),
                 "tp": float(p.tp),
-                "profit": round(float(p.profit), 2),
-                "swap": round(float(p.swap), 2),
+                "profit": float(p.profit),
                 "time": int(p.time),
             }
             for p in filtered
-        ],
-        "agent_floating_pnl": round(sum(float(p.profit) for p in filtered), 2),
+        ]
     }
 
 
@@ -987,28 +902,9 @@ async def close_agent_position(ticket: int = Body(..., embed=True)):
             "comment": result.comment,
         }
 
-    pnl_payload = await _closed_position_pnl_with_retry(int(ticket))
-
-    response: dict[str, Any] = {
+    return {
         "success": True,
         "message": f"Closed position {ticket}.",
-        "ticket": int(ticket),
         "execution_price": float(result.price),
         "volume": float(pos.volume),
     }
-    if pnl_payload.get("success"):
-        response.update(
-            {
-                "total_pnl": pnl_payload["total_pnl"],
-                "gross_profit": pnl_payload.get("gross_profit"),
-                "commission": pnl_payload.get("commission"),
-                "swap": pnl_payload.get("swap"),
-                "exit_price": pnl_payload.get("exit_price"),
-                "deal_count": pnl_payload.get("deal_count"),
-            }
-        )
-    else:
-        response["pnl_pending"] = True
-        response["pnl_error"] = pnl_payload.get("error")
-
-    return response
