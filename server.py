@@ -15,7 +15,6 @@ from reversal_engine import (
     get_reversal_confirm_timeframe,
     uses_separate_confirm_timeframe,
 )
-from htf_alignment import HTF_CASCADE, evaluate_htf_cascade
 
 app = FastAPI()
 
@@ -453,25 +452,6 @@ async def reversal_scan(body: ReversalScanBody):
     return result
 
 
-@app.get("/api/htf-candles")
-async def htf_candles(
-    symbol: str = Query(...),
-    count: int = Query(120, ge=20, le=500),
-):
-    """M15 / H1 / H4 / D1 bars for HTF alignment cascade."""
-    resolved = resolve_mt5_symbol(symbol)
-    if resolved is None:
-        return {"error": f"No MT5 symbol matching {symbol!r}."}
-    out: dict[str, list] = {}
-    for tf in HTF_CASCADE:
-        candles, err = copy_rates_as_candles(resolved, tf, count)
-        if err:
-            out[tf] = []
-        else:
-            out[tf] = candles
-    return {"symbol": resolved, "htfCandles": out}
-
-
 @app.websocket("/ws/rates")
 async def websocket_rates_endpoint(websocket: WebSocket, symbol: str = "BTCUSD", timeframe: str = "M1"):
     await websocket.accept()
@@ -517,18 +497,6 @@ async def websocket_rates_endpoint(websocket: WebSocket, symbol: str = "BTCUSD",
                     payload["confirmTimeframe"] = reversal.get("confirmTimeframe")
                     if len(confirm_candles) >= 2:
                         payload["closedConfirmCandle"] = confirm_candles[-2]
-
-                    htf_by_tf: dict[str, list] = {}
-                    for htf in HTF_CASCADE:
-                        htf_rows, _ = copy_rates_as_candles(symbol, htf, 120)
-                        htf_by_tf[htf] = htf_rows
-                    payload["htfCandles"] = htf_by_tf
-
-                    eval_time = chart_candles[-1]["time"] if chart_candles else 0
-                    for side in ("BUY", "SELL"):
-                        payload[f"htfAlignment_{side}"] = evaluate_htf_cascade(
-                            side, eval_time, chart_candles, htf_by_tf
-                        )
 
                 await websocket.send_json(payload)
             await asyncio.sleep(0.25)
@@ -870,4 +838,77 @@ async def place_market_trade(
         "execution_price": result.price,
         "sl": round(float(sl_price), symbol_info.digits) if sl_price > 0 else 0.0,
         "tp": round(float(tp_price), symbol_info.digits) if tp_price > 0 else 0.0,
+    }
+
+
+@app.post("/api/close")
+async def close_agent_position(ticket: int = Body(..., embed=True)):
+    """Close a single agent-managed position at market (used for liquidity flip)."""
+    positions = mt5.positions_get(ticket=int(ticket))
+    if not positions:
+        return {"success": False, "error": f"Position {ticket} not found."}
+
+    pos = positions[0]
+    if int(pos.magic) != AGENT_MAGIC:
+        return {"success": False, "error": "Position is not managed by the trading agent."}
+
+    symbol_upper = pos.symbol
+    symbol_info = mt5.symbol_info(symbol_upper)
+    if symbol_info is None:
+        return {"success": False, "error": f"Symbol {symbol_upper} not found."}
+
+    if not symbol_info.visible:
+        if not mt5.symbol_select(symbol_upper, True):
+            return {"success": False, "error": f"Failed to select symbol {symbol_upper}."}
+
+    tick = mt5.symbol_info_tick(symbol_upper)
+    if tick is None:
+        return {"success": False, "error": f"No live tick for {symbol_upper}."}
+
+    if pos.type == mt5.POSITION_TYPE_BUY:
+        close_type = mt5.ORDER_TYPE_SELL
+        price = tick.bid
+    else:
+        close_type = mt5.ORDER_TYPE_BUY
+        price = tick.ask
+
+    filling_type = mt5.ORDER_FILLING_FOK
+    if symbol_info.filling_mode & SYMBOL_FILLING_FOK:
+        filling_type = mt5.ORDER_FILLING_FOK
+    elif symbol_info.filling_mode & SYMBOL_FILLING_IOC:
+        filling_type = mt5.ORDER_FILLING_IOC
+    else:
+        filling_type = mt5.ORDER_FILLING_RETURN
+
+    close_request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": symbol_upper,
+        "volume": float(pos.volume),
+        "type": close_type,
+        "position": int(ticket),
+        "price": float(price),
+        "deviation": 20,
+        "magic": AGENT_MAGIC,
+        "comment": "Agent liquidity flip close",
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": filling_type,
+    }
+
+    result = mt5.order_send(close_request)
+    if result is None:
+        return {"success": False, "error": "Close order failed to reach terminal."}
+
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+        return {
+            "success": False,
+            "error": "Broker rejected position close.",
+            "mt5_retcode": result.retcode,
+            "comment": result.comment,
+        }
+
+    return {
+        "success": True,
+        "message": f"Closed position {ticket}.",
+        "execution_price": float(result.price),
+        "volume": float(pos.volume),
     }
