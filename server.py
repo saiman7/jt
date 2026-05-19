@@ -835,3 +835,76 @@ async def place_market_trade(
         "sl": round(float(sl_price), symbol_info.digits) if sl_price > 0 else 0.0,
         "tp": round(float(tp_price), symbol_info.digits) if tp_price > 0 else 0.0,
     }
+
+
+@app.post("/api/close")
+async def close_agent_position(ticket: int = Body(..., embed=True)):
+    """Close a single agent-managed position at market (used for liquidity flip)."""
+    positions = mt5.positions_get(ticket=int(ticket))
+    if not positions:
+        return {"success": False, "error": f"Position {ticket} not found."}
+
+    pos = positions[0]
+    if int(pos.magic) != AGENT_MAGIC:
+        return {"success": False, "error": "Position is not managed by the trading agent."}
+
+    symbol_upper = pos.symbol
+    symbol_info = mt5.symbol_info(symbol_upper)
+    if symbol_info is None:
+        return {"success": False, "error": f"Symbol {symbol_upper} not found."}
+
+    if not symbol_info.visible:
+        if not mt5.symbol_select(symbol_upper, True):
+            return {"success": False, "error": f"Failed to select symbol {symbol_upper}."}
+
+    tick = mt5.symbol_info_tick(symbol_upper)
+    if tick is None:
+        return {"success": False, "error": f"No live tick for {symbol_upper}."}
+
+    if pos.type == mt5.POSITION_TYPE_BUY:
+        close_type = mt5.ORDER_TYPE_SELL
+        price = tick.bid
+    else:
+        close_type = mt5.ORDER_TYPE_BUY
+        price = tick.ask
+
+    filling_type = mt5.ORDER_FILLING_FOK
+    if symbol_info.filling_mode & SYMBOL_FILLING_FOK:
+        filling_type = mt5.ORDER_FILLING_FOK
+    elif symbol_info.filling_mode & SYMBOL_FILLING_IOC:
+        filling_type = mt5.ORDER_FILLING_IOC
+    else:
+        filling_type = mt5.ORDER_FILLING_RETURN
+
+    close_request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": symbol_upper,
+        "volume": float(pos.volume),
+        "type": close_type,
+        "position": int(ticket),
+        "price": float(price),
+        "deviation": 20,
+        "magic": AGENT_MAGIC,
+        "comment": "Agent liquidity flip close",
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": filling_type,
+    }
+
+    result = mt5.order_send(close_request)
+    if result is None:
+        return {"success": False, "error": "Close order failed to reach terminal."}
+
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+        return {
+            "success": False,
+            "error": "Broker rejected position close.",
+            "mt5_retcode": result.retcode,
+            "comment": result.comment,
+        }
+
+    return {
+        "success": True,
+        "message": f"Closed position {ticket}.",
+        "execution_price": float(result.price),
+        "volume": float(pos.volume),
+    }
