@@ -32,7 +32,9 @@ NEXT_PUBLIC_LIVE_MT5_URL=http://127.0.0.1:8000
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/health` | MT5 connection status |
+| GET | `/api/health` | MT5 connection status, balance, equity, floating profit |
+| GET | `/api/account-pnl` | Live broker equity + agent open-position floating P&L |
+| GET | `/api/closed-position-pnl` | Realized P&L for a closed position ticket (profit+commission+swap, retries) |
 | GET | `/api/historical` | Backtest candles + liquidity (`symbol`, `timeframe`, `start_time`, `end_time`) |
 | GET | `/api/recent-candles` | Last N bars (`symbol`, `timeframe`, `count`) |
 | GET | `/api/forming-candle` | Forming M5 bar from M1 stream (`symbol`, `chart_timeframe`) |
@@ -40,6 +42,7 @@ NEXT_PUBLIC_LIVE_MT5_URL=http://127.0.0.1:8000
 | POST | `/api/reversal-scan` | Scan JSON candles + liquidity (no MT5 fetch) |
 | GET | `/api/positions` | Open positions (`symbol`, `magic`) |
 | POST | `/api/trade` | Market order with SL/TP |
+| POST | `/api/close` | Close agent position; returns broker `total_pnl` when deals sync |
 | POST | `/api/lot-for-risk` | Lot size for target USD risk |
 | POST | `/api/calc-profit` | P&L estimate |
 | WS | `/ws/rates` | Streaming candles + liquidity; M1 also sends `reversalPredictions` |
