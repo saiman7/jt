@@ -15,6 +15,7 @@ from reversal_engine import (
     get_reversal_confirm_timeframe,
     uses_separate_confirm_timeframe,
 )
+from m1_push_scalp_engine import analyze_m1_push_scalp
 
 app = FastAPI()
 
@@ -45,6 +46,7 @@ TF_MAP = {
 }
 
 AGENT_MAGIC = 123456
+M1_PUSH_SCALP_MAGIC = 123457
 
 
 def resolve_mt5_symbol(raw: str) -> Optional[str]:
@@ -513,6 +515,50 @@ async def websocket_rates_endpoint(websocket: WebSocket, symbol: str = "BTCUSD",
     except WebSocketDisconnect:
         pass
 
+
+@app.websocket("/ws/m1-push-scalp")
+async def websocket_m1_push_scalp(
+    websocket: WebSocket,
+    symbol: str = "XAUUSD",
+    min_secs_into_bar: int = 8,
+):
+    """Fast M1 tick stream + opening-push scalp signal (separate from liquidity agent)."""
+    await websocket.accept()
+    resolved = resolve_mt5_symbol(symbol)
+    if resolved is None:
+        await websocket.close(code=4404, reason=f"Unknown symbol: {symbol}")
+        return
+    symbol = resolved
+
+    try:
+        while True:
+            tick = mt5.symbol_info_tick(symbol)
+            candles, err = copy_rates_as_candles(symbol, "M1", 8)
+            payload: dict[str, Any] = {
+                "symbol": symbol,
+                "timeframe": "M1",
+                "error": err,
+                "data": candles,
+                "tick": None,
+            }
+            if tick is not None:
+                payload["tick"] = {
+                    "bid": float(tick.bid),
+                    "ask": float(tick.ask),
+                    "time": int(tick.time),
+                }
+            if candles:
+                payload["scalp"] = analyze_m1_push_scalp(
+                    candles,
+                    symbol,
+                    min_secs_into_bar=min_secs_into_bar,
+                )
+            await websocket.send_json(payload)
+            await asyncio.sleep(0.25)
+    except WebSocketDisconnect:
+        pass
+
+
 def normalize_volume(volume: float, symbol_info) -> float:
     """Snap volume down to the symbol's lot step (e.g. 0.208 → 0.20 when step is 0.01)."""
     step = float(symbol_info.volume_step) if symbol_info.volume_step else 0.01
@@ -727,6 +773,7 @@ async def place_market_trade(
     tp: float = Body(0.0, embed=True),
     sl_points: int = Body(None, embed=True),
     tp_points: int = Body(None, embed=True),
+    magic: int = Body(AGENT_MAGIC, embed=True),
 ):
     resolved = resolve_mt5_symbol(symbol)
     if resolved is None:
@@ -743,7 +790,7 @@ async def place_market_trade(
     
     existing_positions = mt5.positions_get(symbol=symbol_upper)
     if existing_positions:
-        agent_positions = [p for p in existing_positions if int(p.magic) == AGENT_MAGIC]
+        agent_positions = [p for p in existing_positions if int(p.magic) == int(magic)]
         if agent_positions:
             return {
                 "success": False,
@@ -821,7 +868,7 @@ async def place_market_trade(
         "sl": round(float(sl_price), symbol_info.digits) if sl_price > 0 else 0.0,
         "tp": round(float(tp_price), symbol_info.digits) if tp_price > 0 else 0.0,
         "deviation": 20,
-        "magic": AGENT_MAGIC,
+        "magic": int(magic),
         "comment": "Sent via FastAPI Gateway",
         "type_time": mt5.ORDER_TIME_GTC,
         "type_filling": filling_type,
@@ -852,15 +899,19 @@ async def place_market_trade(
 
 
 @app.post("/api/close")
-async def close_agent_position(ticket: int = Body(..., embed=True)):
+async def close_agent_position(
+    ticket: int = Body(..., embed=True),
+    magic: int = Body(AGENT_MAGIC, embed=True),
+):
     """Close a single agent-managed position at market (used for liquidity flip)."""
     positions = mt5.positions_get(ticket=int(ticket))
     if not positions:
         return {"success": False, "error": f"Position {ticket} not found."}
 
     pos = positions[0]
-    if int(pos.magic) != AGENT_MAGIC:
-        return {"success": False, "error": "Position is not managed by the trading agent."}
+    allowed = {AGENT_MAGIC, M1_PUSH_SCALP_MAGIC}
+    if int(pos.magic) not in allowed or int(pos.magic) != int(magic):
+        return {"success": False, "error": "Position magic does not match this agent."}
 
     symbol_upper = pos.symbol
     symbol_info = mt5.symbol_info(symbol_upper)
