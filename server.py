@@ -1,6 +1,13 @@
 import asyncio
 import math
+import sys
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
+
+# Ensure `jt/` is on sys.path when uvicorn is started outside this folder
+_JT_DIR = Path(__file__).resolve().parent
+if str(_JT_DIR) not in sys.path:
+    sys.path.insert(0, str(_JT_DIR))
 from typing import Any, List, Optional, Tuple
 import pandas as pd
 import MetaTrader5 as mt5
