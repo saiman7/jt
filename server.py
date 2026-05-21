@@ -517,8 +517,16 @@ async def websocket_rates_endpoint(websocket: WebSocket, symbol: str = "BTCUSD",
                     payload["reversalPredictions"] = reversal.get("predictions", [])
                     payload["confirmTimeframe"] = reversal.get("confirmTimeframe")
 
+                tick = mt5.symbol_info_tick(symbol)
+                if tick is not None:
+                    payload["tick"] = {
+                        "bid": float(tick.bid),
+                        "ask": float(tick.ask),
+                        "time": int(tick.time),
+                    }
+
                 await websocket.send_json(payload)
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.25)
     except WebSocketDisconnect:
         pass
 
