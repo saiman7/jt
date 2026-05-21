@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 _JT_DIR = Path(__file__).resolve().parent
 if str(_JT_DIR) not in sys.path:
     sys.path.insert(0, str(_JT_DIR))
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, TypedDict
 import pandas as pd
 import MetaTrader5 as mt5
 from pydantic import BaseModel, Field
@@ -903,6 +903,440 @@ async def place_market_trade(
         "sl": round(float(sl_price), symbol_info.digits) if sl_price > 0 else 0.0,
         "tp": round(float(tp_price), symbol_info.digits) if tp_price > 0 else 0.0,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SL GUARDIAN
+#
+# Runs a 0.5-second tick loop over every watched position. When price moves
+# `danger_fraction` of the way from entry toward SL the position is closed
+# early (saving part of the risk). The original setup is then kept as a
+# "ghost" for up to `reentry_watch_secs` seconds; if a fresh reversal signal
+# fires on the same liquidity level the guardian emits a `reentry_signal`
+# event so the frontend (or another agent) can re-enter immediately.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SlGuardianConfig(BaseModel):
+    enabled: bool = True
+    # Close early when adverse move equals this fraction of total SL distance
+    danger_fraction: float = Field(0.70, ge=0.05, le=0.99)
+    # Ignore positions younger than this many seconds (avoids spread noise)
+    min_age_secs: int = Field(0, ge=0)
+    # After early exit watch for re-entry for this many seconds (0 = disabled)
+    reentry_watch_secs: int = Field(300, ge=0)
+    magic: int = Field(AGENT_MAGIC)
+
+
+class WatchPositionIn(BaseModel):
+    ticket: int = Field(..., gt=0)
+    symbol: str
+    side: str                           # "BUY" | "SELL"
+    entry: float = Field(..., gt=0)
+    sl: float = Field(..., gt=0)
+    tp: float = Field(0.0)
+    liquidity_price: Optional[float] = None   # original sweep level if known
+    level_type: Optional[str] = None          # "BSL" | "SSL"
+    magic: int = AGENT_MAGIC
+
+
+class _PositionMeta(TypedDict):
+    ticket: int
+    symbol: str
+    side: str
+    entry: float
+    sl: float
+    tp: float
+    magic: int
+    liquidity_price: Optional[float]
+    level_type: Optional[str]
+    opened_at: float
+
+
+class _GhostSetup(TypedDict):
+    symbol: str
+    side: str
+    entry: float
+    sl: float
+    tp: float
+    liquidity_price: Optional[float]
+    level_type: Optional[str]
+    exited_at: float
+    exit_price: float
+    reentry_deadline: float
+
+
+class SlGuardian:
+    """
+    Tick-level SL proximity monitor with ghost re-entry tracking.
+
+    Usage:
+      1. After placing a trade call ``sl_guardian.watch(meta)`` with the
+         ticket, symbol, side, entry, sl, tp and optional liquidity info.
+      2. The internal loop checks price every 0.5 s.  When the adverse move
+         reaches ``danger_fraction × total_SL_distance`` the position is
+         closed at market automatically.
+      3. If ``reentry_watch_secs > 0`` the setup is stored as a ghost; the
+         loop re-polls the reversal engine for a fresh signal on the same
+         liquidity level and emits a ``reentry_signal`` event when found.
+    """
+
+    def __init__(self) -> None:
+        self._config = SlGuardianConfig()
+        self._watched: dict[int, _PositionMeta] = {}
+        self._ghosts: list[_GhostSetup] = []
+        self._log: list[dict] = []
+        self._task: Optional[asyncio.Task] = None
+        self._subscribers: list[asyncio.Queue] = []
+
+    # ── public helpers ────────────────────────────────────────────────────────
+
+    def configure(self, cfg: SlGuardianConfig) -> None:
+        self._config = cfg
+
+    def get_config(self) -> dict:
+        return self._config.model_dump()
+
+    def watch(self, meta: _PositionMeta) -> None:
+        self._watched[meta["ticket"]] = meta
+        self._emit({"type": "watch_added", "ticket": meta["ticket"], "symbol": meta["symbol"]})
+
+    def unwatch(self, ticket: int) -> None:
+        removed = self._watched.pop(ticket, None)
+        if removed:
+            self._emit({"type": "watch_removed", "ticket": ticket})
+
+    def get_status(self) -> dict:
+        now_ts = datetime.now(timezone.utc).timestamp()
+        active_ghosts = [g for g in self._ghosts if g["reentry_deadline"] > now_ts]
+        return {
+            "enabled": self._config.enabled,
+            "danger_fraction": self._config.danger_fraction,
+            "min_age_secs": self._config.min_age_secs,
+            "reentry_watch_secs": self._config.reentry_watch_secs,
+            "watched_count": len(self._watched),
+            "ghost_count": len(active_ghosts),
+            "watched": list(self._watched.values()),
+            "ghosts": active_ghosts,
+            "recent_events": self._log[-30:],
+        }
+
+    # ── pub/sub ───────────────────────────────────────────────────────────────
+
+    def subscribe(self) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue(maxsize=128)
+        self._subscribers.append(q)
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue) -> None:
+        self._subscribers = [x for x in self._subscribers if x is not q]
+
+    def _emit(self, event: dict) -> None:
+        stamped = {**event, "_ts": datetime.now(timezone.utc).isoformat()}
+        self._log.append(stamped)
+        if len(self._log) > 500:
+            self._log = self._log[-500:]
+        for q in self._subscribers:
+            try:
+                q.put_nowait(stamped)
+            except asyncio.QueueFull:
+                pass
+
+    # ── danger check ──────────────────────────────────────────────────────────
+
+    def _in_danger(self, meta: _PositionMeta, bid: float, ask: float) -> bool:
+        """True when price has moved ≥ danger_fraction × risk toward SL."""
+        entry = meta["entry"]
+        sl = meta["sl"]
+        if sl <= 0:
+            return False
+        total_risk = abs(entry - sl)
+        if total_risk < 1e-12:
+            return False
+        # For a BUY the adverse price is the current bid; for SELL it is ask.
+        current = bid if meta["side"] == "BUY" else ask
+        adverse = (entry - current) if meta["side"] == "BUY" else (current - entry)
+        if adverse <= 0:
+            return False
+        return (adverse / total_risk) >= self._config.danger_fraction
+
+    # ── MT5 close helper (called synchronously from async loop) ──────────────
+
+    def _close_position_now(self, ticket: int) -> Tuple[Optional[float], str]:
+        """Market-close a position. Returns (fill_price, error_msg)."""
+        positions = mt5.positions_get(ticket=ticket)
+        if not positions:
+            return None, "Position not found"
+        pos = positions[0]
+        symbol = pos.symbol
+        symbol_info = mt5.symbol_info(symbol)
+        if symbol_info is None:
+            return None, "symbol_info unavailable"
+        if not symbol_info.visible:
+            mt5.symbol_select(symbol, True)
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            return None, "No tick"
+
+        is_buy = pos.type == mt5.POSITION_TYPE_BUY
+        close_type = mt5.ORDER_TYPE_SELL if is_buy else mt5.ORDER_TYPE_BUY
+        price = tick.bid if is_buy else tick.ask
+
+        filling_type = mt5.ORDER_FILLING_FOK
+        if symbol_info.filling_mode & SYMBOL_FILLING_FOK:
+            filling_type = mt5.ORDER_FILLING_FOK
+        elif symbol_info.filling_mode & SYMBOL_FILLING_IOC:
+            filling_type = mt5.ORDER_FILLING_IOC
+        else:
+            filling_type = mt5.ORDER_FILLING_RETURN
+
+        req = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "volume": float(pos.volume),
+            "type": close_type,
+            "position": int(ticket),
+            "price": float(price),
+            "deviation": 20,
+            "magic": int(pos.magic),
+            "comment": "SL Guardian early exit",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": filling_type,
+        }
+        result = mt5.order_send(req)
+        if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+            return float(result.price), ""
+        err = f"retcode={result.retcode if result else 'None'} {mt5.last_error()}"
+        return None, err
+
+    # ── monitoring loop ───────────────────────────────────────────────────────
+
+    async def _loop(self) -> None:
+        while True:
+            try:
+                await asyncio.sleep(0.5)
+                if not self._config.enabled:
+                    continue
+                await self._tick()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:  # noqa: BLE001
+                self._emit({"type": "loop_error", "error": str(exc)})
+
+    async def _tick(self) -> None:
+        now_ts = datetime.now(timezone.utc).timestamp()
+
+        # Prune expired ghosts
+        self._ghosts = [g for g in self._ghosts if g["reentry_deadline"] > now_ts]
+
+        # ── 1. monitor watched positions ──────────────────────────────────────
+        all_positions = mt5.positions_get()
+        open_tickets = {int(p.ticket) for p in (all_positions or [])}
+
+        for ticket in list(self._watched):
+            meta = self._watched[ticket]
+
+            # Already closed externally (broker hit SL/TP)
+            if ticket not in open_tickets:
+                self._emit({"type": "position_closed_externally", "ticket": ticket, "symbol": meta["symbol"]})
+                del self._watched[ticket]
+                continue
+
+            # Respect minimum age
+            if now_ts - meta["opened_at"] < self._config.min_age_secs:
+                continue
+
+            tick = mt5.symbol_info_tick(meta["symbol"])
+            if tick is None:
+                continue
+
+            if not self._in_danger(meta, float(tick.bid), float(tick.ask)):
+                continue
+
+            # ── danger zone hit → close early ─────────────────────────────────
+            fill_price, err = self._close_position_now(ticket)
+            if fill_price is not None:
+                saved = abs(fill_price - meta["sl"])
+                self._emit({
+                    "type": "early_exit",
+                    "ticket": ticket,
+                    "symbol": meta["symbol"],
+                    "side": meta["side"],
+                    "entry": meta["entry"],
+                    "sl": meta["sl"],
+                    "exit_price": fill_price,
+                    "saved_distance": round(saved, 8),
+                    "danger_fraction_reached": self._config.danger_fraction,
+                })
+                del self._watched[ticket]
+
+                if self._config.reentry_watch_secs > 0:
+                    ghost: _GhostSetup = {
+                        "symbol": meta["symbol"],
+                        "side": meta["side"],
+                        "entry": meta["entry"],
+                        "sl": meta["sl"],
+                        "tp": meta["tp"],
+                        "liquidity_price": meta.get("liquidity_price"),
+                        "level_type": meta.get("level_type"),
+                        "exited_at": now_ts,
+                        "exit_price": fill_price,
+                        "reentry_deadline": now_ts + self._config.reentry_watch_secs,
+                    }
+                    self._ghosts.append(ghost)
+            else:
+                self._emit({"type": "early_exit_failed", "ticket": ticket, "symbol": meta["symbol"], "error": err})
+
+        # ── 2. scan ghosts for re-entry ───────────────────────────────────────
+        for ghost in list(self._ghosts):
+            symbol = ghost["symbol"]
+            resolved = resolve_mt5_symbol(symbol)
+            if resolved is None:
+                continue
+
+            # Skip if we already have an open agent position on this symbol
+            existing = mt5.positions_get(symbol=resolved)
+            if existing and any(int(p.magic) in {AGENT_MAGIC, M1_PUSH_SCALP_MAGIC} for p in existing):
+                continue
+
+            candles, err = copy_rates_as_candles(resolved, "M1", 60)
+            if err or not candles:
+                continue
+            df = pd.DataFrame(candles)
+            liquidity = calculate_advanced_liquidity(df, window=5, source_tag="Local")
+            confirm_candles, _ = copy_rates_as_candles(resolved, "M5", 20)
+            result = analyze_live_reversals(
+                candles,
+                confirm_candles if confirm_candles else candles,
+                liquidity,
+                chart_timeframe="M1",
+                trend_filter=False,
+            )
+
+            liq_price = ghost.get("liquidity_price")
+            all_signals: list[dict] = result.get("signals", []) + result.get("predictions", [])
+            matching = [
+                s for s in all_signals
+                if s["side"] == ghost["side"]
+                and liq_price is not None
+                and abs(s["liquidityPrice"] - liq_price) / max(abs(liq_price), 1e-9) < 0.002
+            ]
+
+            if matching:
+                self._emit({
+                    "type": "reentry_signal",
+                    "symbol": symbol,
+                    "side": ghost["side"],
+                    "original_entry": ghost["entry"],
+                    "original_sl": ghost["sl"],
+                    "original_tp": ghost["tp"],
+                    "ghost_exit_price": ghost["exit_price"],
+                    "liquidity_price": liq_price,
+                    "signal": matching[0],
+                })
+                self._ghosts.remove(ghost)
+
+    # ── lifecycle ─────────────────────────────────────────────────────────────
+
+    def start(self) -> None:
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self._loop())
+
+    def stop(self) -> None:
+        if self._task and not self._task.done():
+            self._task.cancel()
+            self._task = None
+
+
+sl_guardian = SlGuardian()
+
+
+@app.on_event("startup")
+async def _start_sl_guardian() -> None:
+    sl_guardian.start()
+
+
+# ── SL Guardian REST endpoints ────────────────────────────────────────────────
+
+@app.post("/api/sl-guardian/configure")
+async def sl_guardian_configure(cfg: SlGuardianConfig):
+    """Update SL Guardian thresholds at runtime."""
+    sl_guardian.configure(cfg)
+    return {"success": True, "config": sl_guardian.get_config()}
+
+
+@app.get("/api/sl-guardian/status")
+async def sl_guardian_status():
+    """Return watched positions, active ghosts, and recent event log."""
+    return sl_guardian.get_status()
+
+
+@app.post("/api/sl-guardian/watch")
+async def sl_guardian_watch(req: WatchPositionIn):
+    """
+    Register a live position with the SL Guardian.
+    Call this immediately after a trade is placed so the guardian starts
+    monitoring it for early exit.
+    """
+    resolved = resolve_mt5_symbol(req.symbol)
+    if resolved is None:
+        return {"success": False, "error": f"Symbol {req.symbol!r} not found in MT5."}
+    side = req.side.upper()
+    if side not in ("BUY", "SELL"):
+        return {"success": False, "error": "side must be BUY or SELL"}
+
+    meta: _PositionMeta = {
+        "ticket": req.ticket,
+        "symbol": resolved,
+        "side": side,
+        "entry": float(req.entry),
+        "sl": float(req.sl),
+        "tp": float(req.tp),
+        "magic": int(req.magic),
+        "liquidity_price": float(req.liquidity_price) if req.liquidity_price is not None else None,
+        "level_type": req.level_type,
+        "opened_at": datetime.now(timezone.utc).timestamp(),
+    }
+    sl_guardian.watch(meta)
+    return {"success": True, "ticket": req.ticket, "symbol": resolved}
+
+
+@app.delete("/api/sl-guardian/watch/{ticket}")
+async def sl_guardian_unwatch(ticket: int):
+    """Remove a position from the SL Guardian (e.g. after manual TP close)."""
+    sl_guardian.unwatch(ticket)
+    return {"success": True, "ticket": ticket}
+
+
+@app.websocket("/ws/sl-guardian")
+async def ws_sl_guardian(websocket: WebSocket):
+    """
+    Stream SL Guardian events in real-time.
+
+    Event types:
+      watch_added           — position registered
+      watch_removed         — position manually un-watched
+      position_closed_externally — broker hit SL or TP before guardian could act
+      early_exit            — guardian closed the position early; includes saved_distance
+      early_exit_failed     — MT5 rejected the close order
+      reentry_signal        — fresh reversal signal found on the same liquidity level
+      loop_error            — internal guardian error (rare)
+    """
+    await websocket.accept()
+    q = sl_guardian.subscribe()
+    try:
+        # Send current status snapshot on connect
+        await websocket.send_json({"type": "snapshot", **sl_guardian.get_status()})
+        while True:
+            try:
+                event = await asyncio.wait_for(q.get(), timeout=15.0)
+                await websocket.send_json(event)
+            except asyncio.TimeoutError:
+                # Heartbeat so the connection stays alive
+                await websocket.send_json({"type": "heartbeat"})
+    except WebSocketDisconnect:
+        pass
+    finally:
+        sl_guardian.unsubscribe(q)
 
 
 @app.post("/api/close")
