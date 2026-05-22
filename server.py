@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 _JT_DIR = Path(__file__).resolve().parent
 if str(_JT_DIR) not in sys.path:
     sys.path.insert(0, str(_JT_DIR))
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, TypedDict
 import pandas as pd
 import MetaTrader5 as mt5
 from pydantic import BaseModel, Field
@@ -510,7 +510,7 @@ async def websocket_rates_endpoint(websocket: WebSocket, symbol: str = "BTCUSD",
                         confirm_candles,
                         combined_liquidity,
                         chart_timeframe=chart_tf,
-                        trend_filter=False,
+                        trend_filter=True,
                     )
                     payload["formingConfirmCandle"] = reversal.get("formingConfirmCandle")
                     payload["reversalSignals"] = reversal.get("signals", [])
@@ -903,6 +903,457 @@ async def place_market_trade(
         "sl": round(float(sl_price), symbol_info.digits) if sl_price > 0 else 0.0,
         "tp": round(float(tp_price), symbol_info.digits) if tp_price > 0 else 0.0,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SL GUARDIAN
+#
+# Two-mode tick loop (runs every 0.5 s):
+#
+#   PROTECTION  — when price moves `danger_fraction` of the way from entry
+#                 toward SL the position is closed at market immediately,
+#                 saving part of the originally risked capital.
+#
+#   STACKING    — while a position is open and has already moved at least
+#                 `stack_profit_threshold` of the way toward TP, the guardian
+#                 scans for a fresh same-direction reversal signal.  If one is
+#                 found (and the total open positions on that symbol is below
+#                 `max_stack_positions`) a `stack_signal` event is emitted so
+#                 the frontend can open an additional position and ride the move
+#                 harder.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SlGuardianConfig(BaseModel):
+    enabled: bool = True
+    # Close early when adverse move equals this fraction of total SL distance
+    danger_fraction: float = Field(0.70, ge=0.05, le=0.99)
+    # Ignore positions younger than this many seconds (avoids spread noise)
+    min_age_secs: int = Field(0, ge=0)
+    # Maximum number of stacked positions allowed per symbol (1 = stacking off)
+    max_stack_positions: int = Field(2, ge=1, le=5)
+    # Position must have moved this fraction toward TP before stacking is allowed
+    stack_profit_threshold: float = Field(0.30, ge=0.05, le=0.90)
+    magic: int = Field(AGENT_MAGIC)
+
+
+class WatchPositionIn(BaseModel):
+    ticket: int = Field(..., gt=0)
+    symbol: str
+    side: str                           # "BUY" | "SELL"
+    entry: float = Field(..., gt=0)
+    sl: float = Field(..., gt=0)
+    tp: float = Field(0.0)
+    liquidity_price: Optional[float] = None   # original sweep level if known
+    level_type: Optional[str] = None          # "BSL" | "SSL"
+    magic: int = AGENT_MAGIC
+
+
+class _PositionMeta(TypedDict):
+    ticket: int
+    symbol: str
+    side: str
+    entry: float
+    sl: float
+    tp: float
+    magic: int
+    liquidity_price: Optional[float]
+    level_type: Optional[str]
+    opened_at: float
+
+
+class SlGuardian:
+    """
+    Tick-level SL proximity monitor with position-stacking engine.
+
+    Usage:
+      1. After placing a trade call ``sl_guardian.watch(meta)`` with the
+         ticket, symbol, side, entry, sl, tp and optional liquidity info.
+      2. The internal loop checks price every 0.5 s.
+         - PROTECTION: when price moves >= danger_fraction × SL distance
+           the position is closed at market immediately.
+         - STACKING: when the position has moved >= stack_profit_threshold
+           toward TP and a fresh same-direction reversal signal is detected,
+           a ``stack_signal`` event fires so the frontend can add to the
+           winner.
+    """
+
+    def __init__(self) -> None:
+        self._config = SlGuardianConfig()
+        self._watched: dict[int, _PositionMeta] = {}
+        # De-duplication set for stack signals — keyed by ticket+signal identity
+        self._stack_emitted: set[str] = set()
+        self._log: list[dict] = []
+        self._task: Optional[asyncio.Task] = None
+        self._subscribers: list[asyncio.Queue] = []
+
+    # ── public helpers ────────────────────────────────────────────────────────
+
+    def configure(self, cfg: SlGuardianConfig) -> None:
+        self._config = cfg
+
+    def get_config(self) -> dict:
+        return self._config.model_dump()
+
+    def watch(self, meta: _PositionMeta) -> None:
+        self._watched[meta["ticket"]] = meta
+        self._emit({"type": "watch_added", "ticket": meta["ticket"], "symbol": meta["symbol"]})
+
+    def unwatch(self, ticket: int) -> None:
+        removed = self._watched.pop(ticket, None)
+        if removed:
+            self._emit({"type": "watch_removed", "ticket": ticket})
+
+    def get_status(self) -> dict:
+        return {
+            "enabled": self._config.enabled,
+            "danger_fraction": self._config.danger_fraction,
+            "min_age_secs": self._config.min_age_secs,
+            "max_stack_positions": self._config.max_stack_positions,
+            "stack_profit_threshold": self._config.stack_profit_threshold,
+            "watched_count": len(self._watched),
+            "watched": list(self._watched.values()),
+            "recent_events": self._log[-30:],
+        }
+
+    # ── pub/sub ───────────────────────────────────────────────────────────────
+
+    def subscribe(self) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue(maxsize=128)
+        self._subscribers.append(q)
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue) -> None:
+        self._subscribers = [x for x in self._subscribers if x is not q]
+
+    def _emit(self, event: dict) -> None:
+        stamped = {**event, "_ts": datetime.now(timezone.utc).isoformat()}
+        self._log.append(stamped)
+        if len(self._log) > 500:
+            self._log = self._log[-500:]
+        for q in self._subscribers:
+            try:
+                q.put_nowait(stamped)
+            except asyncio.QueueFull:
+                pass
+
+    # ── danger check ──────────────────────────────────────────────────────────
+
+    def _in_danger(self, meta: _PositionMeta, bid: float, ask: float) -> bool:
+        """True when price has moved ≥ danger_fraction × risk toward SL."""
+        entry = meta["entry"]
+        sl = meta["sl"]
+        if sl <= 0:
+            return False
+        total_risk = abs(entry - sl)
+        if total_risk < 1e-12:
+            return False
+        # For a BUY the adverse price is the current bid; for SELL it is ask.
+        current = bid if meta["side"] == "BUY" else ask
+        adverse = (entry - current) if meta["side"] == "BUY" else (current - entry)
+        if adverse <= 0:
+            return False
+        return (adverse / total_risk) >= self._config.danger_fraction
+
+    # ── MT5 close helper (called synchronously from async loop) ──────────────
+
+    def _close_position_now(self, ticket: int) -> Tuple[Optional[float], str]:
+        """Market-close a position. Returns (fill_price, error_msg)."""
+        positions = mt5.positions_get(ticket=ticket)
+        if not positions:
+            return None, "Position not found"
+        pos = positions[0]
+        symbol = pos.symbol
+        symbol_info = mt5.symbol_info(symbol)
+        if symbol_info is None:
+            return None, "symbol_info unavailable"
+        if not symbol_info.visible:
+            mt5.symbol_select(symbol, True)
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            return None, "No tick"
+
+        is_buy = pos.type == mt5.POSITION_TYPE_BUY
+        close_type = mt5.ORDER_TYPE_SELL if is_buy else mt5.ORDER_TYPE_BUY
+        price = tick.bid if is_buy else tick.ask
+
+        filling_type = mt5.ORDER_FILLING_FOK
+        if symbol_info.filling_mode & SYMBOL_FILLING_FOK:
+            filling_type = mt5.ORDER_FILLING_FOK
+        elif symbol_info.filling_mode & SYMBOL_FILLING_IOC:
+            filling_type = mt5.ORDER_FILLING_IOC
+        else:
+            filling_type = mt5.ORDER_FILLING_RETURN
+
+        req = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "volume": float(pos.volume),
+            "type": close_type,
+            "position": int(ticket),
+            "price": float(price),
+            "deviation": 20,
+            "magic": int(pos.magic),
+            "comment": "SL Guardian early exit",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": filling_type,
+        }
+        result = mt5.order_send(req)
+        if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+            return float(result.price), ""
+        err = f"retcode={result.retcode if result else 'None'} {mt5.last_error()}"
+        return None, err
+
+    # ── monitoring loop ───────────────────────────────────────────────────────
+
+    async def _loop(self) -> None:
+        while True:
+            try:
+                await asyncio.sleep(0.5)
+                if not self._config.enabled:
+                    continue
+                await self._tick()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:  # noqa: BLE001
+                self._emit({"type": "loop_error", "error": str(exc)})
+
+    async def _tick(self) -> None:
+        now_ts = datetime.now(timezone.utc).timestamp()
+
+        # ── 1. protection — monitor watched positions for early exit ──────────
+        all_positions = mt5.positions_get()
+        open_tickets = {int(p.ticket) for p in (all_positions or [])}
+
+        for ticket in list(self._watched):
+            meta = self._watched[ticket]
+
+            # Already closed externally (broker hit SL/TP)
+            if ticket not in open_tickets:
+                self._emit({"type": "position_closed_externally", "ticket": ticket, "symbol": meta["symbol"]})
+                del self._watched[ticket]
+                continue
+
+            # Respect minimum age
+            if now_ts - meta["opened_at"] < self._config.min_age_secs:
+                continue
+
+            tick = mt5.symbol_info_tick(meta["symbol"])
+            if tick is None:
+                continue
+
+            if not self._in_danger(meta, float(tick.bid), float(tick.ask)):
+                continue
+
+            # ── danger zone hit → close early ─────────────────────────────────
+            fill_price, err = self._close_position_now(ticket)
+            if fill_price is not None:
+                saved = abs(fill_price - meta["sl"])
+                self._emit({
+                    "type": "early_exit",
+                    "ticket": ticket,
+                    "symbol": meta["symbol"],
+                    "side": meta["side"],
+                    "entry": meta["entry"],
+                    "sl": meta["sl"],
+                    "exit_price": fill_price,
+                    "saved_distance": round(saved, 8),
+                    "danger_fraction_reached": self._config.danger_fraction,
+                })
+                del self._watched[ticket]
+                # Remove any pending stack keys for this ticket so a future
+                # fresh position isn't accidentally deduplicated.
+                self._stack_emitted = {k for k in self._stack_emitted if not k.startswith(f"{ticket}-")}
+            else:
+                self._emit({"type": "early_exit_failed", "ticket": ticket, "symbol": meta["symbol"], "error": err})
+
+        # ── 2. stacking — add to winners when a new confirming signal fires ───
+        if self._config.max_stack_positions <= 1 or not self._watched:
+            return
+
+        # Bound the de-dup set to avoid unbounded growth
+        if len(self._stack_emitted) > 1000:
+            self._stack_emitted = set(list(self._stack_emitted)[-500:])
+
+        for ticket, meta in list(self._watched.items()):
+            symbol = meta["symbol"]
+            resolved = resolve_mt5_symbol(symbol)
+            if resolved is None:
+                continue
+
+            # Count total agent positions already open on this symbol
+            existing = mt5.positions_get(symbol=resolved)
+            open_count = len([
+                p for p in (existing or [])
+                if int(p.magic) in {AGENT_MAGIC, M1_PUSH_SCALP_MAGIC}
+            ])
+            if open_count >= self._config.max_stack_positions:
+                continue
+
+            # Position must have moved at least stack_profit_threshold toward TP
+            tick = mt5.symbol_info_tick(symbol)
+            if tick is None:
+                continue
+            current = float(tick.bid) if meta["side"] == "BUY" else float(tick.ask)
+            entry = meta["entry"]
+            tp = meta["tp"]
+            if tp <= 0:
+                continue
+            tp_distance = abs(tp - entry)
+            if tp_distance < 1e-12:
+                continue
+            favorable_move = (current - entry) if meta["side"] == "BUY" else (entry - current)
+            profit_fraction = favorable_move / tp_distance
+            if profit_fraction < self._config.stack_profit_threshold:
+                continue
+
+            # Scan for a fresh same-direction reversal signal (last 5 minutes only)
+            candles, cerr = copy_rates_as_candles(resolved, "M1", 60)
+            if cerr or not candles:
+                continue
+            df = pd.DataFrame(candles)
+            liquidity = calculate_advanced_liquidity(df, window=5, source_tag="Local")
+            confirm_candles, _ = copy_rates_as_candles(resolved, "M5", 20)
+            rev_result = analyze_live_reversals(
+                candles,
+                confirm_candles if confirm_candles else candles,
+                liquidity,
+                chart_timeframe="M1",
+                trend_filter=False,
+            )
+
+            all_signals: list[dict] = rev_result.get("signals", []) + rev_result.get("predictions", [])
+            fresh = [
+                s for s in all_signals
+                if s["side"] == meta["side"]
+                and s.get("reversalTime", 0) > now_ts - 300
+            ]
+            if not fresh:
+                continue
+
+            sig = fresh[0]
+            stack_key = f"{ticket}-{sig.get('reversalTime', 0)}-{sig.get('liquidityPrice', 0)}"
+            if stack_key in self._stack_emitted:
+                continue
+            self._stack_emitted.add(stack_key)
+
+            self._emit({
+                "type": "stack_signal",
+                "anchor_ticket": ticket,
+                "symbol": symbol,
+                "side": meta["side"],
+                "anchor_entry": entry,
+                "anchor_sl": meta["sl"],
+                "anchor_tp": tp,
+                "current_price": round(current, 8),
+                "profit_fraction": round(profit_fraction, 3),
+                "open_count": open_count,
+                "max_stack": self._config.max_stack_positions,
+                "signal": sig,
+            })
+
+    # ── lifecycle ─────────────────────────────────────────────────────────────
+
+    def start(self) -> None:
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self._loop())
+
+    def stop(self) -> None:
+        if self._task and not self._task.done():
+            self._task.cancel()
+            self._task = None
+
+
+sl_guardian = SlGuardian()
+
+
+@app.on_event("startup")
+async def _start_sl_guardian() -> None:
+    sl_guardian.start()
+
+
+# ── SL Guardian REST endpoints ────────────────────────────────────────────────
+
+@app.post("/api/sl-guardian/configure")
+async def sl_guardian_configure(cfg: SlGuardianConfig):
+    """Update SL Guardian thresholds at runtime."""
+    sl_guardian.configure(cfg)
+    return {"success": True, "config": sl_guardian.get_config()}
+
+
+@app.get("/api/sl-guardian/status")
+async def sl_guardian_status():
+    """Return watched positions, active ghosts, and recent event log."""
+    return sl_guardian.get_status()
+
+
+@app.post("/api/sl-guardian/watch")
+async def sl_guardian_watch(req: WatchPositionIn):
+    """
+    Register a live position with the SL Guardian.
+    Call this immediately after a trade is placed so the guardian starts
+    monitoring it for early exit.
+    """
+    resolved = resolve_mt5_symbol(req.symbol)
+    if resolved is None:
+        return {"success": False, "error": f"Symbol {req.symbol!r} not found in MT5."}
+    side = req.side.upper()
+    if side not in ("BUY", "SELL"):
+        return {"success": False, "error": "side must be BUY or SELL"}
+
+    meta: _PositionMeta = {
+        "ticket": req.ticket,
+        "symbol": resolved,
+        "side": side,
+        "entry": float(req.entry),
+        "sl": float(req.sl),
+        "tp": float(req.tp),
+        "magic": int(req.magic),
+        "liquidity_price": float(req.liquidity_price) if req.liquidity_price is not None else None,
+        "level_type": req.level_type,
+        "opened_at": datetime.now(timezone.utc).timestamp(),
+    }
+    sl_guardian.watch(meta)
+    return {"success": True, "ticket": req.ticket, "symbol": resolved}
+
+
+@app.delete("/api/sl-guardian/watch/{ticket}")
+async def sl_guardian_unwatch(ticket: int):
+    """Remove a position from the SL Guardian (e.g. after manual TP close)."""
+    sl_guardian.unwatch(ticket)
+    return {"success": True, "ticket": ticket}
+
+
+@app.websocket("/ws/sl-guardian")
+async def ws_sl_guardian(websocket: WebSocket):
+    """
+    Stream SL Guardian events in real-time.
+
+    Event types:
+      watch_added                — position registered
+      watch_removed              — position manually un-watched
+      position_closed_externally — broker hit SL or TP before guardian could act
+      early_exit                 — guardian closed the position early; includes saved_distance
+      early_exit_failed          — MT5 rejected the close order
+      stack_signal               — position profitable enough to stack; new same-direction
+                                   reversal signal detected; includes anchor_ticket + signal
+      loop_error                 — internal guardian error (rare)
+    """
+    await websocket.accept()
+    q = sl_guardian.subscribe()
+    try:
+        # Send current status snapshot on connect
+        await websocket.send_json({"type": "snapshot", **sl_guardian.get_status()})
+        while True:
+            try:
+                event = await asyncio.wait_for(q.get(), timeout=15.0)
+                await websocket.send_json(event)
+            except asyncio.TimeoutError:
+                # Heartbeat so the connection stays alive
+                await websocket.send_json({"type": "heartbeat"})
+    except WebSocketDisconnect:
+        pass
+    finally:
+        sl_guardian.unsubscribe(q)
 
 
 @app.post("/api/close")

@@ -67,6 +67,43 @@ def is_bearish_reversal_candle(c: Candle) -> bool:
     return c["close"] < c["open"] and c["high"] > c["open"]
 
 
+def is_reversal_liquidity_sweep(lvl: LiquidityLevel, candle: Candle) -> bool:
+    """Wick through pool then close back on trade side (rejection grab)."""
+    price = float(lvl["price"])
+    if lvl["type"] == "SSL":
+        return candle["low"] < price and candle["close"] > price
+    return candle["high"] > price and candle["close"] < price
+
+
+def market_trend_bias(candles: list[Candle], lookback: int = 20) -> Literal["BULLISH", "BEARISH"]:
+    if len(candles) < 3:
+        return "BULLISH"
+    slice_ = candles[-lookback:]
+    avg = sum(c["close"] for c in slice_) / len(slice_)
+    return "BULLISH" if candles[-1]["close"] > avg else "BEARISH"
+
+
+def sweep_allowed_for_trend(
+    level_type: Literal["BSL", "SSL"],
+    bias: Literal["BULLISH", "BEARISH"],
+    trend_filter: bool,
+) -> bool:
+    if not trend_filter:
+        return True
+    if level_type == "SSL":
+        return bias == "BULLISH"
+    return bias == "BEARISH"
+
+
+def is_reversal_confirm_candle(
+    side: Literal["BUY", "SELL"], candle: Candle, liquidity_price: float
+) -> bool:
+    price = float(liquidity_price)
+    if side == "BUY":
+        return is_bullish_reversal_candle(candle) and candle["close"] > price
+    return is_bearish_reversal_candle(candle) and candle["close"] < price
+
+
 def count_confirm_bars_since(
     sweep_time: int, confirm_bar_time: int, period_sec: int = M5_PERIOD_SEC
 ) -> int:
@@ -161,8 +198,12 @@ def scan_reversal_predictions(
         key = _level_key(p["levelType"], p["liquidityTargetPrice"])
         if key in consumed:
             continue
-        buy_ok = p["side"] == "BUY" and is_bullish_reversal_candle(forming_confirm)
-        sell_ok = p["side"] == "SELL" and is_bearish_reversal_candle(forming_confirm)
+        buy_ok = is_reversal_confirm_candle(
+            "BUY", forming_confirm, p["liquidityTargetPrice"]
+        )
+        sell_ok = is_reversal_confirm_candle(
+            "SELL", forming_confirm, p["liquidityTargetPrice"]
+        )
         if not buy_ok and not sell_ok:
             continue
         out.append(emit_reversal_signal(p, forming_confirm, is_prediction=True))
@@ -184,20 +225,19 @@ def scan_reversal_signals_dual(
 
     for i, current in enumerate(sweep_candles):
         visible = sweep_candles[: i + 1]
-        bias: Literal["BULLISH", "BEARISH"] = "BULLISH"
-        if trend_filter and len(visible) > 20:
-            avg = sum(c["close"] for c in visible[-20:]) / 20
-            bias = "BULLISH" if current["close"] > avg else "BEARISH"
+        bias = market_trend_bias(visible)
 
         for lvl in liquidity:
             price = float(lvl["price"])
             key = f"{lvl['type']}|{price}"
             if key in consumed or key in pending:
                 continue
+            if not is_reversal_liquidity_sweep(lvl, current):
+                continue
+            if not sweep_allowed_for_trend(lvl["type"], bias, trend_filter):
+                continue
 
-            if lvl["type"] == "BSL" and current["high"] > price and current["open"] <= price:
-                if trend_filter and bias != "BEARISH":
-                    continue
+            if lvl["type"] == "BSL":
                 pending[key] = {
                     "side": "SELL",
                     "liquidityTargetPrice": price,
@@ -205,9 +245,7 @@ def scan_reversal_signals_dual(
                     "sweepTime": current["time"],
                     "sweepCandle": dict(current),
                 }
-            elif lvl["type"] == "SSL" and current["low"] < price and current["open"] >= price:
-                if trend_filter and bias != "BULLISH":
-                    continue
+            else:
                 pending[key] = {
                     "side": "BUY",
                     "liquidityTargetPrice": price,
@@ -228,8 +266,12 @@ def scan_reversal_signals_dual(
             if bars_since > REVERSAL_CONFIRM_MAX_BARS:
                 del pending[key]
                 continue
-            buy_ok = p["side"] == "BUY" and is_bullish_reversal_candle(confirm_bar)
-            sell_ok = p["side"] == "SELL" and is_bearish_reversal_candle(confirm_bar)
+            buy_ok = is_reversal_confirm_candle(
+                "BUY", confirm_bar, p["liquidityTargetPrice"]
+            )
+            sell_ok = is_reversal_confirm_candle(
+                "SELL", confirm_bar, p["liquidityTargetPrice"]
+            )
             if not buy_ok and not sell_ok:
                 continue
             signals.append(emit_reversal_signal(p, confirm_bar))
@@ -248,16 +290,15 @@ def detect_pending_setups_from_candle(
 ) -> list[PendingSetup]:
     """Pending sweeps on the latest (forming) chart bar vs liquidity levels."""
     pending: list[PendingSetup] = []
-    bias: Literal["BULLISH", "BEARISH"] = "BULLISH"
-    if trend_filter and recent_candles and len(recent_candles) > 20:
-        avg = sum(c["close"] for c in recent_candles[-20:]) / 20
-        bias = "BULLISH" if active_candle["close"] > avg else "BEARISH"
+    bias = market_trend_bias(recent_candles or [active_candle])
 
     for lvl in liquidity:
         price = float(lvl["price"])
-        if lvl["type"] == "BSL" and active_candle["high"] > price and active_candle["open"] <= price:
-            if trend_filter and bias != "BEARISH":
-                continue
+        if not is_reversal_liquidity_sweep(lvl, active_candle):
+            continue
+        if not sweep_allowed_for_trend(lvl["type"], bias, trend_filter):
+            continue
+        if lvl["type"] == "BSL":
             pending.append(
                 {
                     "side": "SELL",
@@ -267,9 +308,7 @@ def detect_pending_setups_from_candle(
                     "sweepCandle": dict(active_candle),
                 }
             )
-        elif lvl["type"] == "SSL" and active_candle["low"] < price and active_candle["open"] >= price:
-            if trend_filter and bias != "BULLISH":
-                continue
+        else:
             pending.append(
                 {
                     "side": "BUY",
