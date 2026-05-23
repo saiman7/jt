@@ -28,12 +28,13 @@ class LiquidityLevel(TypedDict, total=False):
     is_grabbed: bool
 
 
-class PendingSetup(TypedDict):
+class PendingSetup(TypedDict, total=False):
     side: Literal["BUY", "SELL"]
     liquidityTargetPrice: float
     levelType: Literal["BSL", "SSL"]
     sweepTime: int
     sweepCandle: Candle
+    acceptanceTime: Optional[int]
 
 
 class ReversalSignal(TypedDict, total=False):
@@ -65,6 +66,85 @@ def is_bullish_reversal_candle(c: Candle) -> bool:
 
 def is_bearish_reversal_candle(c: Candle) -> bool:
     return c["close"] < c["open"] and c["high"] > c["open"]
+
+
+def _level_tolerance(level_price: float) -> float:
+    return max(level_price * 0.00008, 0.05)
+
+
+def is_wick_only_at_level(side: str, level_price: float, c: Candle) -> bool:
+    tol = _level_tolerance(level_price)
+    if side == "BUY":
+        return (
+            c["low"] < level_price - tol
+            and c["close"] > level_price + tol
+            and min(c["open"], c["close"]) > level_price - tol
+        )
+    return (
+        c["high"] > level_price + tol
+        and c["close"] < level_price - tol
+        and max(c["open"], c["close"]) < level_price + tol
+    )
+
+
+def is_body_close_into_level(side: str, level_price: float, c: Candle) -> bool:
+    if is_wick_only_at_level(side, level_price, c):
+        return False
+    tol = _level_tolerance(level_price)
+    body_top = max(c["open"], c["close"])
+    body_bottom = min(c["open"], c["close"])
+    body_size = body_top - body_bottom
+    min_body = tol * 0.35
+    if side == "BUY":
+        closes_in = c["close"] <= level_price + tol
+        body_engages = body_bottom <= level_price + tol and body_top >= level_price - tol * 2
+        return closes_in and body_engages and body_size >= min_body
+    closes_in = c["close"] >= level_price - tol
+    body_engages = body_top >= level_price - tol and body_bottom <= level_price + tol * 2
+    return closes_in and body_engages and body_size >= min_body
+
+
+def is_reversal_follow_through(side: str, c: Candle) -> bool:
+    rng = c["high"] - c["low"]
+    if rng <= 0:
+        return False
+    body = abs(c["close"] - c["open"])
+    if side == "BUY":
+        wick_rejection = c["close"] > c["open"] and c["low"] < c["open"]
+        full_body = c["close"] > c["open"] and body / rng >= 0.45
+        return wick_rejection or full_body
+    wick_rejection = c["close"] < c["open"] and c["high"] > c["open"]
+    full_body = c["close"] < c["open"] and body / rng >= 0.45
+    return wick_rejection or full_body
+
+
+def advance_two_step_reversal(
+    side: str,
+    level_price: float,
+    bar_time: int,
+    bar: Candle,
+    acceptance_time: Optional[int],
+) -> tuple[Optional[int], bool]:
+    if acceptance_time is None:
+        if is_body_close_into_level(side, level_price, bar):
+            return bar_time, False
+        return None, False
+    if bar_time <= acceptance_time:
+        return acceptance_time, False
+    return acceptance_time, is_reversal_follow_through(side, bar)
+
+
+def enrich_pending_acceptance(
+    pending: PendingSetup, confirm_candles: list[Candle]
+) -> PendingSetup:
+    if pending.get("acceptanceTime"):
+        return pending
+    for bar in confirm_candles:
+        if bar["time"] <= pending["sweepTime"]:
+            continue
+        if is_body_close_into_level(pending["side"], pending["liquidityTargetPrice"], bar):
+            return {**pending, "acceptanceTime": bar["time"]}
+    return pending
 
 
 def count_confirm_bars_since(
@@ -161,9 +241,16 @@ def scan_reversal_predictions(
         key = _level_key(p["levelType"], p["liquidityTargetPrice"])
         if key in consumed:
             continue
-        buy_ok = p["side"] == "BUY" and is_bullish_reversal_candle(forming_confirm)
-        sell_ok = p["side"] == "SELL" and is_bearish_reversal_candle(forming_confirm)
-        if not buy_ok and not sell_ok:
+        if not p.get("acceptanceTime"):
+            continue
+        _, ready = advance_two_step_reversal(
+            p["side"],
+            p["liquidityTargetPrice"],
+            forming_confirm["time"],
+            forming_confirm,
+            p.get("acceptanceTime"),
+        )
+        if not ready:
             continue
         out.append(emit_reversal_signal(p, forming_confirm, is_prediction=True))
 
@@ -204,6 +291,7 @@ def scan_reversal_signals_dual(
                     "levelType": "BSL",
                     "sweepTime": current["time"],
                     "sweepCandle": dict(current),
+                    "acceptanceTime": None,
                 }
             elif lvl["type"] == "SSL" and current["low"] < price and current["open"] >= price:
                 if trend_filter and bias != "BULLISH":
@@ -214,6 +302,7 @@ def scan_reversal_signals_dual(
                     "levelType": "SSL",
                     "sweepTime": current["time"],
                     "sweepCandle": dict(current),
+                    "acceptanceTime": None,
                 }
 
     for confirm_bar in confirm_candles:
@@ -228,9 +317,15 @@ def scan_reversal_signals_dual(
             if bars_since > REVERSAL_CONFIRM_MAX_BARS:
                 del pending[key]
                 continue
-            buy_ok = p["side"] == "BUY" and is_bullish_reversal_candle(confirm_bar)
-            sell_ok = p["side"] == "SELL" and is_bearish_reversal_candle(confirm_bar)
-            if not buy_ok and not sell_ok:
+            acceptance, ready = advance_two_step_reversal(
+                p["side"],
+                p["liquidityTargetPrice"],
+                confirm_bar["time"],
+                confirm_bar,
+                p.get("acceptanceTime"),
+            )
+            p["acceptanceTime"] = acceptance
+            if not ready:
                 continue
             signals.append(emit_reversal_signal(p, confirm_bar))
             consumed.add(key)
@@ -328,6 +423,7 @@ def analyze_live_reversals(
         forming = chart_candles[-1]
 
     eval_time = chart_candles[-1]["time"] if chart_candles else 0
+    pending = [enrich_pending_acceptance(p, confirm_candles) for p in pending]
     predictions = scan_reversal_predictions(pending, forming, evaluation_time=eval_time)
     confirmed_keys = {
         _level_key(s["levelType"], s["liquidityPrice"])

@@ -740,7 +740,7 @@ async def get_open_positions(
     symbol: str = Query(None),
     magic: int = Query(AGENT_MAGIC),
 ):
-    """Return agent-managed open positions so the frontend never stacks orders."""
+    """Return agent-managed open positions (same-symbol same-side adds are allowed via /api/trade)."""
     if symbol:
         resolved = resolve_mt5_symbol(symbol)
         if resolved is None:
@@ -795,15 +795,22 @@ async def place_market_trade(
     symbol_upper = resolved
     action_upper = action.upper()
     
-    existing_positions = mt5.positions_get(symbol=symbol_upper)
-    if existing_positions:
-        agent_positions = [p for p in existing_positions if int(p.magic) == int(magic)]
-        if agent_positions:
+    existing_positions = mt5.positions_get(symbol=symbol_upper) or []
+    agent_positions = [p for p in existing_positions if int(p.magic) == int(magic)]
+    stacked_onto_ticket: Optional[int] = None
+    if agent_positions:
+        existing = agent_positions[0]
+        existing_type = "BUY" if existing.type == mt5.POSITION_TYPE_BUY else "SELL"
+        if existing_type != action_upper:
             return {
                 "success": False,
-                "error": f"An open {symbol_upper} position already exists. Close it before opening another.",
+                "error": (
+                    f"An open {symbol_upper} {existing_type} exists; cannot open opposite "
+                    f"{action_upper}. Close it first or use continuation in the same direction."
+                ),
                 "open_tickets": [int(p.ticket) for p in agent_positions],
             }
+        stacked_onto_ticket = int(existing.ticket)
 
     symbol_info = mt5.symbol_info(symbol_upper)
     if symbol_info is None:
@@ -894,11 +901,58 @@ async def place_market_trade(
             "comment": result.comment
         }
 
+    stacked = stacked_onto_ticket is not None
+    position_ticket = stacked_onto_ticket
+    total_volume = order_volume
+
+    if stacked:
+        refreshed = mt5.positions_get(symbol=symbol_upper) or []
+        agent_after = [p for p in refreshed if int(p.magic) == int(magic)]
+        if agent_after:
+            pos_after = agent_after[0]
+            position_ticket = int(pos_after.ticket)
+            total_volume = float(pos_after.volume)
+
+        if sl_price > 0 or tp_price > 0:
+            sltp_request = {
+                "action": mt5.TRADE_ACTION_SLTP,
+                "symbol": symbol_upper,
+                "position": position_ticket,
+                "sl": round(float(sl_price), symbol_info.digits) if sl_price > 0 else 0.0,
+                "tp": round(float(tp_price), symbol_info.digits) if tp_price > 0 else 0.0,
+                "magic": int(magic),
+            }
+            sltp_result = mt5.order_send(sltp_request)
+            if sltp_result is not None and sltp_result.retcode != mt5.TRADE_RETCODE_DONE:
+                return {
+                    "success": True,
+                    "stacked": True,
+                    "message": (
+                        f"Added {order_volume} lots to {symbol_upper} {action_upper}, "
+                        f"but SL/TP update failed: {sltp_result.comment}"
+                    ),
+                    "order_id": result.order,
+                    "position_ticket": position_ticket,
+                    "volume": total_volume,
+                    "added_volume": order_volume,
+                    "execution_price": result.price,
+                    "sl": round(float(sl_price), symbol_info.digits) if sl_price > 0 else 0.0,
+                    "tp": round(float(tp_price), symbol_info.digits) if tp_price > 0 else 0.0,
+                    "sltp_retcode": sltp_result.retcode,
+                }
+
     return {
         "success": True,
-        "message": f"Successfully executed live market {action_upper} order.",
+        "stacked": stacked,
+        "message": (
+            f"Added {order_volume} lots to existing {symbol_upper} {action_upper}."
+            if stacked
+            else f"Successfully executed live market {action_upper} order."
+        ),
         "order_id": result.order,
-        "volume": order_volume,
+        "position_ticket": position_ticket,
+        "volume": total_volume,
+        "added_volume": order_volume if stacked else None,
         "execution_price": result.price,
         "sl": round(float(sl_price), symbol_info.digits) if sl_price > 0 else 0.0,
         "tp": round(float(tp_price), symbol_info.digits) if tp_price > 0 else 0.0,
