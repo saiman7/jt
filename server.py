@@ -572,6 +572,17 @@ async def websocket_rates_endpoint(websocket: WebSocket, symbol: str = "BTCUSD",
                     payload["reversalPredictions"] = reversal.get("predictions", [])
                     payload["confirmTimeframe"] = reversal.get("confirmTimeframe")
 
+                # When charting M1, also compute M5 structural liquidity so the
+                # frontend can filter for setups that align with the higher timeframe.
+                if chart_tf == "M1":
+                    m5_rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, 120)
+                    if m5_rates is not None and len(m5_rates) > 0:
+                        df_m5 = pd.DataFrame(m5_rates)
+                        m5_liq = calculate_advanced_liquidity(df_m5, window=5, source_tag="M5")
+                        # Keep only un-grabbed (still-live) M5 levels, newest first
+                        live_m5 = [l for l in m5_liq if not l.get("is_grabbed", False)]
+                        payload["m5Liquidity"] = live_m5[-20:]
+
                 await websocket.send_json(payload)
             await asyncio.sleep(1)
     except WebSocketDisconnect:
