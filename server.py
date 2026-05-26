@@ -43,6 +43,12 @@ if not mt5.initialize():
 SYMBOL_FILLING_FOK = 1
 SYMBOL_FILLING_IOC = 2
 
+# Live agent chart depth — broker-like context for structure / sweeps
+LIVE_WS_CHART_BARS = 2000  # M1 ≈ 33h, M5 ≈ 7d
+LIVE_WS_M5_BARS = 500
+LIVE_WS_CONFIRM_BARS = 300
+LIVE_LIQUIDITY_RECENT_LEVELS = 30
+
 TF_MAP = {
     "M1": mt5.TIMEFRAME_M1,
     "M5": mt5.TIMEFRAME_M5,
@@ -295,7 +301,7 @@ async def get_historical_backtest_data(
 async def recent_candles(
     symbol: str = Query(...),
     timeframe: str = Query("M1"),
-    count: int = Query(16, ge=2, le=500),
+    count: int = Query(16, ge=2, le=3000),
 ):
     """Last N closed+forming bars for sweep confirmation (e.g. M5 when chart is M1)."""
     resolved = resolve_mt5_symbol(symbol)
@@ -542,13 +548,13 @@ async def websocket_rates_endpoint(websocket: WebSocket, symbol: str = "BTCUSD",
     
     try:
         while True:
-            rates = mt5.copy_rates_from_pos(symbol, mt5_tf, 0, 250)
+            rates = mt5.copy_rates_from_pos(symbol, mt5_tf, 0, LIVE_WS_CHART_BARS)
             if rates is not None and len(rates) > 0:
                 df = pd.DataFrame(rates)
                 chart_candles = df_to_candles(df)
                 advanced_liquidity = calculate_advanced_liquidity(df, window=5, source_tag="Local")
                 fib_zones = calculate_fib_golden_zones(advanced_liquidity, max_recent=6, source_prefix="Fib_50_Local")
-                combined_liquidity = advanced_liquidity[-10:] + fib_zones
+                combined_liquidity = advanced_liquidity[-LIVE_LIQUIDITY_RECENT_LEVELS:] + fib_zones
 
                 payload: dict[str, Any] = {
                     "symbol": symbol,
@@ -559,7 +565,9 @@ async def websocket_rates_endpoint(websocket: WebSocket, symbol: str = "BTCUSD",
 
                 chart_tf = timeframe.upper()
                 if uses_separate_confirm_timeframe(chart_tf):
-                    confirm_candles, _ = copy_rates_as_candles(symbol, get_reversal_confirm_timeframe(chart_tf), 80)
+                    confirm_candles, _ = copy_rates_as_candles(
+                        symbol, get_reversal_confirm_timeframe(chart_tf), LIVE_WS_CONFIRM_BARS
+                    )
                     reversal = analyze_live_reversals(
                         chart_candles,
                         confirm_candles,
@@ -575,7 +583,7 @@ async def websocket_rates_endpoint(websocket: WebSocket, symbol: str = "BTCUSD",
                 # When charting M1, also compute M5 structural liquidity so the
                 # frontend can filter for setups that align with the higher timeframe.
                 if chart_tf == "M1":
-                    m5_rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, 120)
+                    m5_rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, LIVE_WS_M5_BARS)
                     if m5_rates is not None and len(m5_rates) > 0:
                         df_m5 = pd.DataFrame(m5_rates)
                         m5_liq = calculate_advanced_liquidity(df_m5, window=5, source_tag="M5")
