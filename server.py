@@ -340,6 +340,61 @@ async def account_balance():
     }
 
 
+@app.get("/api/symbols")
+async def list_broker_symbols(
+    visible_only: bool = Query(
+        True,
+        description="When true, only symbols currently visible in Market Watch.",
+    ),
+):
+    """
+    Tradeable instrument names from the connected MT5 terminal.
+    Includes account mode (demo vs real) when account_info is available.
+    """
+    account = mt5.account_info()
+    raw = mt5.symbols_get()
+    if raw is None:
+        err = mt5.last_error()
+        return {
+            "success": False,
+            "error": str(err) if err else "symbols_get failed",
+            "symbols": [],
+            "account": None,
+        }
+
+    symbols_out: List[dict] = []
+    for sym in raw:
+        if int(sym.trade_mode) == 0:
+            continue
+        if visible_only and not sym.visible:
+            continue
+        symbols_out.append(
+            {
+                "name": sym.name,
+                "description": sym.description or "",
+                "visible": bool(sym.visible),
+            }
+        )
+
+    symbols_out.sort(key=lambda x: x["name"])
+
+    account_out = None
+    if account is not None:
+        trade_mode = int(account.trade_mode)
+        account_out = {
+            "login": int(account.login),
+            "server": account.server,
+            "trade_mode": trade_mode,
+            "is_demo": trade_mode == 0,
+        }
+
+    return {
+        "success": True,
+        "symbols": symbols_out,
+        "account": account_out,
+    }
+
+
 @app.get("/api/forming-candle")
 async def forming_candle(
     symbol: str = Query(...),
