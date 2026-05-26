@@ -42,7 +42,8 @@ DEFAULT_PROFILE: Dict[str, Any] = {
 # Gold-tuned values match the doc (H1 → M15 → M5 stack).
 SYMBOL_PROFILES: Dict[str, Dict[str, Any]] = {
     "XAUUSD": dict(DEFAULT_PROFILE),
-    "GOLD":   dict(DEFAULT_PROFILE),
+    "XAUUSDR": dict(DEFAULT_PROFILE),  # demo suffix (XAUUSDr)
+    "GOLD": dict(DEFAULT_PROFILE),
 }
 
 

@@ -60,23 +60,76 @@ TF_MAP = {
 AGENT_MAGIC = 123456
 M1_PUSH_SCALP_MAGIC = 123457
 
+# UI / DB use XAUUSD; demo brokers often expose XAUUSDr, live accounts XAUUSD.
+GOLD_CANONICAL = "XAUUSD"
+GOLD_BROKER_ALIASES = (
+    "XAUUSD",
+    "XAUUSDr",
+    "XAUUSDz",
+    "XAUUSD.",
+    "XAUUSDm",
+    "GOLD",
+)
+
+
+def canonical_symbol(raw: str) -> str:
+    """Normalize gold broker suffixes to XAUUSD for logging and session storage."""
+    if not raw or not str(raw).strip():
+        return ""
+    s = str(raw).strip()
+    upper = s.upper()
+    if upper.startswith("XAU") or upper == "GOLD":
+        return GOLD_CANONICAL
+    return s
+
+
+def _is_gold_query(needle: str) -> bool:
+    return needle.startswith("XAU") or needle == "GOLD"
+
 
 def resolve_mt5_symbol(raw: str) -> Optional[str]:
     """
     Return the symbol string exactly as the broker exposes it in MT5.
-    UI often passes mixed case (e.g. BTCUSDr) while .upper() breaks symbol_info on some servers.
+    UI often passes XAUUSD while the demo account lists XAUUSDr (and vice versa).
     """
     if not raw or not str(raw).strip():
         return None
     s = str(raw).strip()
-    for candidate in (s, s.upper(), s.lower()):
+    needle = s.upper()
+    canonical = canonical_symbol(s)
+
+    candidates: List[str] = []
+    seen: set[str] = set()
+
+    def add(c: str) -> None:
+        if c and c not in seen:
+            seen.add(c)
+            candidates.append(c)
+
+    add(s)
+    add(s.upper())
+    add(s.lower())
+    if _is_gold_query(needle):
+        for alias in GOLD_BROKER_ALIASES:
+            add(alias)
+
+    for candidate in candidates:
         info = mt5.symbol_info(candidate)
         if info is not None:
             return info.name
-    needle = s.upper()
+
     for sym in mt5.symbols_get() or ():
         if sym.name.upper() == needle:
             return sym.name
+
+    if _is_gold_query(needle):
+        for sym in mt5.symbols_get() or ():
+            name_upper = sym.name.upper()
+            if name_upper.startswith("XAU") and "USD" in name_upper:
+                info = mt5.symbol_info(sym.name)
+                if info is not None:
+                    return info.name
+
     return None
 
 
@@ -393,6 +446,28 @@ async def reversal_live(
     }
 
 
+@app.get("/api/resolve-symbol")
+async def resolve_symbol_endpoint(symbol: str = Query(...)):
+    """
+    Map UI symbol (e.g. XAUUSD) to the broker's exact MT5 name (e.g. XAUUSDr on demo).
+    """
+    resolved = resolve_mt5_symbol(symbol)
+    if resolved is None:
+        return {
+            "success": False,
+            "requested": symbol,
+            "canonical": canonical_symbol(symbol),
+            "broker": None,
+            "error": f"No MT5 symbol matching {symbol!r}.",
+        }
+    return {
+        "success": True,
+        "requested": symbol,
+        "canonical": canonical_symbol(symbol),
+        "broker": resolved,
+    }
+
+
 @app.get("/api/a-plus-context")
 async def a_plus_context_endpoint(symbol: str = Query(...)):
     """
@@ -491,6 +566,7 @@ async def websocket_rates_endpoint(websocket: WebSocket, symbol: str = "BTCUSD",
 
                 payload: dict[str, Any] = {
                     "symbol": symbol,
+                    "canonicalSymbol": canonical_symbol(symbol),
                     "timeframe": timeframe,
                     "data": df[["time", "open", "high", "low", "close"]].to_dict(orient="records"),
                     "liquidity": combined_liquidity,
