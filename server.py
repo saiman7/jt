@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 _JT_DIR = Path(__file__).resolve().parent
 if str(_JT_DIR) not in sys.path:
     sys.path.insert(0, str(_JT_DIR))
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Literal, Optional, Tuple
 import pandas as pd
 import MetaTrader5 as mt5
 from pydantic import BaseModel, Field
@@ -23,6 +23,11 @@ from reversal_engine import (
     uses_separate_confirm_timeframe,
 )
 from m1_push_scalp_engine import analyze_m1_push_scalp
+from a_plus_context import (
+    compute_a_plus_context,
+    profile_for_symbol,
+    validate_a_plus_entry,
+)
 
 app = FastAPI()
 
@@ -149,72 +154,40 @@ def calculate_advanced_liquidity(df, window=5, source_tag="Local"):
     return liquidity_segments
 
 
-def calculate_fib_golden_zones(swings, max_recent=12, source_prefix="Fib_50"):
+# -------------------------------------------------------------
+# A+ context (HTF bias + MTF zone) — drives strict entry gate
+# -------------------------------------------------------------
+def build_a_plus_context_for_symbol(symbol: str, fallback_price: Optional[float] = None) -> dict:
     """
-    Pair consecutive opposite swings into legs and emit the 50% retracement as a
-    sweep target. Output reuses BSL/SSL types so the existing engine treats them
-    like structural liquidity (one-candle SL, post-sweep confirm, MT5 sizing).
-
-      Bearish leg  (BSL -> SSL)  → 50% emitted as BSL  (sweep up + reject = SELL)
-      Bullish leg  (SSL -> BSL)  → 50% emitted as SSL  (sweep down + reject = BUY)
+    Fetch HTF + MTF bars per the symbol profile and return the A+ context.
+    Returns {"error": ...} on failure so the frontend can degrade gracefully.
     """
-    if not swings or len(swings) < 2:
-        return []
+    profile = profile_for_symbol(symbol)
+    htf_candles, htf_err = copy_rates_as_candles(symbol, profile["htf"], profile["htf_count"])
+    mtf_candles, mtf_err = copy_rates_as_candles(symbol, profile["mtf"], profile["mtf_count"])
 
-    sorted_swings = sorted(swings, key=lambda s: s.get("start_time", 0))
-    zones = []
+    if htf_err or mtf_err:
+        return {
+            "error": htf_err or mtf_err,
+            "htfTimeframe": profile["htf"],
+            "mtfTimeframe": profile["mtf"],
+            "htf": {"bias": "NEUTRAL", "reason": "HTF bars unavailable"},
+            "mtf": {"zone": "UNKNOWN", "reason": "MTF bars unavailable"},
+        }
 
-    for i in range(1, len(sorted_swings)):
-        prev = sorted_swings[i - 1]
-        curr = sorted_swings[i]
-        prev_type = prev.get("type")
-        curr_type = curr.get("type")
-        if prev_type == curr_type:
-            continue
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is not None:
+        current_price = float((tick.bid + tick.ask) / 2.0)
+    elif fallback_price is not None:
+        current_price = float(fallback_price)
+    elif mtf_candles:
+        current_price = float(mtf_candles[-1]["close"])
+    else:
+        current_price = 0.0
 
-        try:
-            prev_price = float(prev.get("price", 0))
-            curr_price = float(curr.get("price", 0))
-        except (TypeError, ValueError):
-            continue
-
-        # Bearish leg: high → low ; mid is a SELL retracement target
-        if prev_type == "BSL" and curr_type == "SSL":
-            high = prev_price
-            low = curr_price
-            if high <= low:
-                continue
-            mid = round((high + low) / 2.0, 5)
-            zones.append({
-                "type": "BSL",
-                "price": mid,
-                "start_time": int(curr.get("start_time", 0)),
-                "end_time": int(curr.get("end_time", 0)),
-                "is_grabbed": False,
-                "level_source": source_prefix,
-                "leg_high": high,
-                "leg_low": low,
-            })
-
-        # Bullish leg: low → high ; mid is a BUY retracement target
-        elif prev_type == "SSL" and curr_type == "BSL":
-            low = prev_price
-            high = curr_price
-            if high <= low:
-                continue
-            mid = round((high + low) / 2.0, 5)
-            zones.append({
-                "type": "SSL",
-                "price": mid,
-                "start_time": int(curr.get("start_time", 0)),
-                "end_time": int(curr.get("end_time", 0)),
-                "is_grabbed": False,
-                "level_source": source_prefix,
-                "leg_high": high,
-                "leg_low": low,
-            })
-
-    return zones[-max_recent:]
+    ctx = compute_a_plus_context(htf_candles, mtf_candles, current_price, profile=profile)
+    ctx["currentPrice"] = current_price
+    return ctx
 
 
 # -------------------------------------------------------------
@@ -277,11 +250,6 @@ async def get_historical_backtest_data(
 
     # Combine both local triggers and macro targets into an integrated landscape array
     combined_liquidity = ltf_liquidity + htf_liquidity
-
-    # Add Fib 50% golden-zone retracement targets for trend continuation entries
-    fib_local = calculate_fib_golden_zones(ltf_liquidity, max_recent=12, source_prefix="Fib_50_Local")
-    fib_macro = calculate_fib_golden_zones(htf_liquidity, max_recent=6, source_prefix="Fib_50_Macro_H4")
-    combined_liquidity = combined_liquidity + fib_local + fib_macro
 
     return {
         "symbol": symbol,
@@ -409,9 +377,7 @@ async def reversal_live(
         confirm_candles = chart_candles
 
     df_chart = pd.DataFrame(chart_candles)
-    liquidity = calculate_advanced_liquidity(df_chart, window=5, source_tag="Local")
-    fib = calculate_fib_golden_zones(liquidity, max_recent=6, source_prefix="Fib_50_Local")
-    combined = liquidity + fib
+    combined = calculate_advanced_liquidity(df_chart, window=5, source_tag="Local")
 
     result = analyze_live_reversals(
         chart_candles,
@@ -425,6 +391,35 @@ async def reversal_live(
         "liquidity": combined[-20:],
         **result,
     }
+
+
+@app.get("/api/a-plus-context")
+async def a_plus_context_endpoint(symbol: str = Query(...)):
+    """
+    Current A+ context (HTF bias + MTF premium/discount/equilibrium) for a symbol.
+    Used by the live agent UI to display gate status and by debugging.
+    """
+    resolved = resolve_mt5_symbol(symbol)
+    if resolved is None:
+        return {"error": f"No MT5 symbol matching {symbol!r}."}
+    ctx = build_a_plus_context_for_symbol(resolved)
+    ctx["symbol"] = resolved
+    return ctx
+
+
+class APlusValidateBody(BaseModel):
+    side: Literal["BUY", "SELL"]
+    symbol: str
+
+
+@app.post("/api/a-plus-validate")
+async def a_plus_validate_endpoint(body: APlusValidateBody):
+    """Return whether a hypothetical entry passes the A+ gate right now."""
+    resolved = resolve_mt5_symbol(body.symbol)
+    if resolved is None:
+        return {"error": f"No MT5 symbol matching {body.symbol!r}."}
+    ctx = build_a_plus_context_for_symbol(resolved)
+    return {"symbol": resolved, "context": ctx, "verdict": validate_a_plus_entry(body.side, ctx)}
 
 
 class ReversalScanBody(BaseModel):
@@ -492,8 +487,7 @@ async def websocket_rates_endpoint(websocket: WebSocket, symbol: str = "BTCUSD",
                 df = pd.DataFrame(rates)
                 chart_candles = df_to_candles(df)
                 advanced_liquidity = calculate_advanced_liquidity(df, window=5, source_tag="Local")
-                fib_zones = calculate_fib_golden_zones(advanced_liquidity, max_recent=6, source_prefix="Fib_50_Local")
-                combined_liquidity = advanced_liquidity[-10:] + fib_zones
+                combined_liquidity = advanced_liquidity[-10:]
 
                 payload: dict[str, Any] = {
                     "symbol": symbol,
@@ -516,6 +510,11 @@ async def websocket_rates_endpoint(websocket: WebSocket, symbol: str = "BTCUSD",
                     payload["reversalSignals"] = reversal.get("signals", [])
                     payload["reversalPredictions"] = reversal.get("predictions", [])
                     payload["confirmTimeframe"] = reversal.get("confirmTimeframe")
+
+                # A+ context (HTF bias + MTF zone) attached on every tick so the
+                # client can strictly gate entries against the doc rules.
+                fallback_price = float(chart_candles[-1]["close"]) if chart_candles else None
+                payload["aPlusContext"] = build_a_plus_context_for_symbol(symbol, fallback_price)
 
                 await websocket.send_json(payload)
             await asyncio.sleep(1)
